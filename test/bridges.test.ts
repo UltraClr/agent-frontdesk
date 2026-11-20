@@ -442,6 +442,25 @@ test('Antigravity confirms a group receipt within its own native input bounds', 
   assert.equal(unresolved.turns[0]?.statusEvidence, null);
 });
 
+test('Antigravity links a verified same-execution steer without borrowing its private reply', async t => {
+  const marker = '[Frontdesk · group/steered]';
+  const input = agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: marker + '\nReview' } }, { executionId: 'first' });
+  for (const executionId of ['first', 'different']) {
+    const { bridge } = antigravityFixture([
+      input,
+      agyStep('GENERIC', 'DONE'),
+      agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'Continue' } }, { executionId, isInterruptingStep: true }),
+      agyStep('PLANNER_RESPONSE', 'DONE', { plannerResponse: { response: 'Private follow-up result' } }, { executionId: 'resumed' }),
+    ], { inputIndex: 2, t });
+    const history = await bridge.coordinationHistory('c1', { marker, turnId: 'turn-0' });
+    assert.deepEqual(history.receiptContinuation, executionId === 'first' ? { turnId: 'turn-0', nextTurnId: 'turn-2' } : undefined);
+    assert.equal(history.turns[0]?.statusEvidence, null);
+    assert.equal(history.turns[0]?.assistantReply, '');
+    assert.equal(history.turns[1]?.assistantReply, 'Private follow-up result');
+    assert.equal((await bridge.coordinationHistory('c1', { marker: '[Frontdesk · group/wrong]' })).receiptContinuation, undefined);
+  }
+});
+
 test('Antigravity displays a native quota limit live and after reload even when the transcript omitted it', async t => {
   const message = 'Individual quota reached. Resets in 3h53m38s.';
   const report = agyStep('ERROR_MESSAGE', 'DONE', {

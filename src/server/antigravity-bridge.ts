@@ -27,7 +27,7 @@ import { promptStarts } from '../shared/turn-match.js';
 import { bag, errorField, get, isBag, list, messageOf, parseJson, str, text as asText, type Bag } from '../shared/guards.js';
 import type {
   Approval, BridgeConfig, CreateInput, CreateResult, DictationHandlers, DictationReady, DictationStream, EngineEmitter, EngineStatus,
-  FileTarget, MediaFile, Model, RecentMessage, SendInput, TimeValue, Usage, UsageWindow, UnifiedStep as Step,
+  FileTarget, History, MediaFile, Model, RecentMessage, SendInput, TimeValue, Usage, UsageWindow, UnifiedStep as Step,
 } from '../shared/contract.js';
 
 // Values documented by `agentapi new-conversation --model=<flash_lite|flash|pro|model_id>`.
@@ -703,7 +703,7 @@ class AntigravityBridge extends EventEmitter {
     return { session, turns };
   }
 
-  async coordinationHistory(id: string, receipt?: { marker: string; turnId?: string | null }) {
+  async coordinationHistory(id: string, receipt?: { marker: string; turnId?: string | null }): Promise<History & { session: UnifiedSession }> {
     const history = await this.getConversationHistory(id);
     const latest = history.turns.at(-1);
     const turn = receipt ? history.turns.find(item => (!receipt.turnId || item.id === receipt.turnId) &&
@@ -712,17 +712,26 @@ class AntigravityBridge extends EventEmitter {
     const row = this.row(id);
     const input = /^turn-(\d+)$/.exec(turn.id)?.[1];
     const historical = turn !== latest;
-    if (!row || input == null || (!historical && Number(row['not_fully_idle']) !== 0)) return history;
+    if (!row || input == null) return history;
+    const offset = Number(input);
+    const hasLaterInput = historical || Number(row['last_user_input_step_index']) > offset;
+    if (!hasLaterInput && Number(row['not_fully_idle']) !== 0) return history;
     try {
       // The summary can point at -1 for a created chat, or at a later private message.
       // Read the requested turn from its own native input and stop at the next input.
-      const offset = Number(input);
       const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: offset }, { timeout: 3500 }), 'steps'));
       if (stepKind(steps[0]) !== 'USER_INPUT') return history;
       if (receipt && !promptStarts(asText(recordsOfStep(steps[0], offset)[0]?.content), receipt.marker)) return history;
       const nextInput = steps.findIndex((step, index) => index > 0 && stepKind(step) === 'USER_INPUT');
-      if (historical && nextInput < 0) return history;
+      if (hasLaterInput && nextInput < 0) return history;
       const outcome = outcomeOfSteps(steps.slice(1, nextInput < 0 ? undefined : nextInput), true);
+      const execution = str(get(steps[0], 'metadata', 'executionId'));
+      const next = steps[nextInput];
+      if (receipt && execution && get(next, 'metadata', 'executionId') === execution &&
+        get(next, 'metadata', 'isInterruptingStep') === true && stepStatus(next) === 'DONE' &&
+        (!outcome || outcome.status === 'completed')) {
+        return { ...history, receiptContinuation: { turnId: turn.id, nextTurnId: `turn-${offset + nextInput}` } };
+      }
       if (outcome) Object.assign(turn, { status: outcome.status, statusEvidence: 'desktop_trajectory', ...(outcome.error && { error: outcome.error.message }) });
     } catch { /* The original record remains readable while the desktop reconnects. */ }
     return history;

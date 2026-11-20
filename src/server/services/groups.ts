@@ -17,7 +17,7 @@ type ReportBinding = { engine: string; id: string; origin?: string };
 type RecordReport = (binding: ReportBinding, id: string, text: string) => void;
 type RosterEntry = { alias: string; enrollment: string };
 type MemberStep = { member: string; text: string; sources?: string[]; enrollment?: string | null; followsPrevious?: boolean };
-type TaskState = 'open' | 'waiting' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed';
+type TaskState = 'open' | 'waiting' | 'paused' | 'completed' | 'partial' | 'continued' | 'cancelled' | 'failed';
 type StoredTask = { id: string; revision: number; state: TaskState; allowParallel?: boolean };
 
 interface GroupRecord {
@@ -209,10 +209,10 @@ export class Groups {
   }
 
   private delivery(room: GroupRecord, work: Work, taskId = work.taskId): GroupDelivery {
-    const { id, groupId, engine, target, question, kind, nativeTurn, dispatched, note, attention, memberId, outcome } = work;
+    const { id, groupId, engine, target, question, kind, nativeTurn, continuedAtTurn, dispatched, note, attention, memberId, outcome } = work;
     const member = kind === 'member' ? workMember(room, work) : undefined;
     return { id, groupId, engine, target: member?.sessionId || target, question, kind,
-      state: memberCreationRefused(work) ? 'blocked' : work.state, nativeTurn, dispatched, note, attention, memberId, outcome,
+      state: memberCreationRefused(work) ? 'blocked' : work.state, nativeTurn, continuedAtTurn, dispatched, note, attention, memberId, outcome,
       creatingMember: !!member?.dedicated && !member.sessionId, removedMember: work.formerMember?.alias,
       ...(work.awaitingOutcome && { awaitingOutcome: true }),
       ...(taskId && { taskId, taskRevision: taskRevision(work) }) };
@@ -279,7 +279,7 @@ export class Groups {
     const picked = this.store().prepare('SELECT 1 FROM group_adoptions WHERE room=? AND message=?');
     const entries = works.flatMap<GroupResults['entries'][number]>(work => {
       const message = this.findMessage(id, work.id + '/reply');
-      if (work.kind === 'host' && !message?.decision && work.state === 'done' && !work.summaryOnly) return [];
+      if (work.kind === 'host' && !message?.decision && work.state === 'done' && work.outcome !== 'continued' && !work.summaryOnly) return [];
       return [{
         id: work.id, engine: work.engine, label: work.kind === 'host' ? '' : workMember(room, work)?.alias || message?.author || work.engine,
         message, delivery: this.delivery(room, work, taskId),
@@ -1119,9 +1119,11 @@ export class Groups {
     const current = this.taskWork(room.id, task.id).filter(item => hosted(item) && item.version === work.version);
     if (current.some(item => item.state !== 'done')) return;
     const branches = current.filter(item => item.parallelBatch || (item.template && item.kind === 'member'));
-    const failedBranch = branches.some(item => item.outcome !== 'completed');
-    task.state = failedBranch ? branches.some(item => item.outcome === 'completed') ? 'partial' : 'failed'
-      : outcome === 'completed' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
+    const incomplete = branches.some(item => item.outcome !== 'completed');
+    const continued = outcome === 'continued' || branches.some(item => item.outcome === 'continued');
+    if (incomplete && branches.some(item => item.outcome === 'completed')) task.state = 'partial';
+    else if (continued && !branches.some(item => item.outcome === 'failed' || item.outcome === 'interrupted')) task.state = 'continued';
+    else task.state = incomplete ? 'failed' : outcome === 'completed' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
   }
 
   private pauseMemberPlan(room: GroupRecord, work: Parameters<Groups['currentTask']>[1] & Pick<Work, 'id'>, alias: string, question: string, next?: string) {
@@ -1318,7 +1320,7 @@ export class Groups {
       contextReads: work.contextReads, remaining: 0, root: work.root, resume: false, summaryOnly: true });
   }
 
-  private acceptReceipt(work: Work, turn: UnifiedTurn, desktopMovedOn: boolean) {
+  private acceptReceipt(work: Work, turn: UnifiedTurn, desktopMovedOn: boolean, continuedAtTurn?: string) {
     return this.transaction(() => {
       const live = this.activeWork(work.id);
       if (!live) return;
@@ -1326,6 +1328,19 @@ export class Groups {
       const room = this.record(work.groupId);
       room.task ??= this.roomTask(room);
       work.nativeTurn = turn.id;
+      const taskId = work.taskId ?? (hosted(work) ? work.root : undefined);
+      const base = { id: work.id + '/reply', author: work.kind === 'host' ? 'host' : workMember(room, work)?.alias || '',
+        replyTo: work.question, native: { engine: work.engine, id: work.target, turn: turn.id },
+        ...(taskId && { taskId, taskRevision: taskRevision(work) }) };
+      if (continuedAtTurn) {
+        work.continuedAtTurn = continuedAtTurn;
+        delete work.awaitingOutcome;
+        this.append(room, { ...base, kind: 'notice', native: { ...base.native, turn: continuedAtTurn },
+          text: '这一轮已在原会话续接，打开原会话查看后续结果' });
+        this.finish(room, work, 'continued');
+        this.setRoom(room);
+        return work;
+      }
       const approval = turn.approvals?.[0];
       if (approval || !terminal(turn)) {
         work.state = approval ? 'waiting' : 'sent';
@@ -1335,10 +1350,6 @@ export class Groups {
         return;
       }
       delete work.awaitingOutcome;
-      const taskId = work.taskId ?? (hosted(work) ? work.root : undefined);
-      const base = { id: work.id + '/reply', author: work.kind === 'host' ? 'host' : workMember(room, work)?.alias || '',
-        replyTo: work.question, native: { engine: work.engine, id: work.target, turn: turn.id },
-        ...(taskId && { taskId, taskRevision: taskRevision(work) }) };
       if (work.kind === 'host') this.finishHost(room, work, turn, { ...base, kind: 'host' });
       else if (work.kind === 'report') {
         if (work.binding?.origin && this.reportTarget(work.binding)) this.reportChannel(work.binding, work.id, work.channelReport || work.prompt);
@@ -1352,7 +1363,9 @@ export class Groups {
         this.append(room, { ...base, kind: 'member', text });
         if (!room.paused && this.currentTask(room, work)?.state === 'open' && work.parallelBatch) {
           const batch = this.taskWork(room.id, work.root).filter(item => item.parallelBatch === work.parallelBatch);
-          if (batch.every(item => item.id === work.id || item.state === 'done')) this.summarizeBatch(room, work, base.id, batch.map(item => item.id + '/reply'));
+          if (batch.every(item => item.id === work.id || (item.state === 'done' && item.outcome !== 'continued'))) {
+            this.summarizeBatch(room, work, base.id, batch.map(item => item.id + '/reply'));
+          }
         } else if (!room.paused && this.currentTask(room, work)?.state === 'open' && work.template && !work.batch?.length) {
           const batch = this.taskWork(room.id, work.root).filter(item => item.template && taskRevision(item) === taskRevision(work));
           this.summarizeBatch(room, work, base.id, batch.map(item => item.id + '/reply'));
@@ -1599,7 +1612,8 @@ export class Groups {
           const turn = history.turns.find(turn => (!nativeTurn || turn.id === nativeTurn) && promptStarts(turn.userPrompt, marker(id)));
           // Only an explicit, correlated native record can confirm a message.
           if (turn) this.acceptReceipt(work, turn,
-            turn !== history.turns.at(-1) || (history.session.status === 'idle' && !sessionBusy(history)));
+            turn !== history.turns.at(-1) || (history.session.status === 'idle' && !sessionBusy(history)),
+            history.receiptContinuation?.turnId === turn.id ? history.receiptContinuation.nextTurnId : undefined);
           else {
             const run = this.runs.get(work.engine, work.target);
             const approval = run?.origin === work.id ? run.run.approvals[0] : undefined;

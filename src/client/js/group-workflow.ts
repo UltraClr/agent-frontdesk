@@ -2,7 +2,7 @@ import type { GroupResults, GroupTemplateInput, GroupTemplatePreview } from '../
 import type { GroupMessage, GroupView } from '../../shared/groups.js';
 import { messageOf } from '../../shared/guards.js';
 import { request } from './api.js';
-import { language, t } from './i18n.js';
+import { language, say, t } from './i18n.js';
 import { escape, hydrateIcons, icon, markdown } from './renderers.js';
 
 const api = (room: string) => '/api/groups/' + encodeURIComponent(room);
@@ -11,7 +11,10 @@ const sourceLink = (room: string, message: string) => '#group/' + encodeURICompo
 const nativeLink = (message: NonNullable<GroupMessage['native']>) => '#' + [message.engine, message.id, message.turn].map(encodeURIComponent).join('/');
 const hasOutput = (entry: GroupResults['entries'][number]) => entry.delivery?.outcome === 'completed' &&
   (entry.message?.kind === 'member' || entry.message?.decision === true);
-const outcomes = { completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止', cancelled: '已撤销待投递消息' } as const;
+export const receiptOutcomes = {
+  completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止',
+  continued: '已在原会话续接', cancelled: '已撤销待投递消息',
+} as const;
 const pending = { queued: '等待投递', sent: '等待目标回复', blocked: '未投递', waiting: '等待用户操作', done: '投递记录已结束' } as const;
 const planned = { planned: '等待上一步结果', paused: '群任务已暂停', cancelled: '已停止后续派发',
   'previous-failed': '前一步未完成', removed: '已移出群聊', 'not-sent': '未投递' } as const;
@@ -156,7 +159,7 @@ export class GroupWorkflowDialog {
       status.textContent = view.entries.length ? '' : t('等待本次任务的结果');
       const markup = view.entries.map(item => {
         const message = item.message, delivery = item.delivery;
-        const state = item.pending ? planned[item.pending] : delivery?.outcome ? outcomes[delivery.outcome]
+        const state = item.pending ? planned[item.pending] : delivery?.outcome ? receiptOutcomes[delivery.outcome]
           : delivery?.awaitingOutcome ? '正在确认原生轮次结果'
             : delivery?.state === 'sent' && !delivery.nativeTurn ? '正在确认桌面记录'
               : delivery?.state === 'queued' && delivery.note ? '群任务受阻' : delivery ? pending[delivery.state] : '';
@@ -164,7 +167,7 @@ export class GroupWorkflowDialog {
         return `<article class="group-result-card"><header><strong>${escape(labelOf(item))}</strong>
           <span class="group-state-pill" data-tone="${usable ? 'positive' : 'neutral'}">${t(state)}</span>
           ${item.adopted ? `<span class="group-state-pill" data-tone="positive">${t('已采纳')}</span>` : ''}</header>
-          ${message ? `<div class="markdown">${markdown(message.text)}</div>` : ''}
+          ${message ? `<div class="markdown">${markdown(message.kind === 'notice' ? say(message.text) : message.text)}</div>` : ''}
           ${delivery?.note ? `<p class="field-help">${escape(delivery.note)}</p>` : ''}
           <footer>${message ? `<a href="${escape(sourceLink(room.id, message.id))}">${t('查看群发言')}</a>` : ''}
           ${message?.native ? `<a href="${escape(nativeLink(message.native))}">${t('查看原会话')}</a>`

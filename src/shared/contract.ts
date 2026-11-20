@@ -228,7 +228,12 @@ export interface UnifiedTurn {
   workedMs: number;
 }
 
-export interface History { session: UnifiedSession | null; turns: UnifiedTurn[] }
+export interface History {
+  session: UnifiedSession | null;
+  turns: UnifiedTurn[];
+  /** The marked receipt was steered into a later input of the same native execution. */
+  receiptContinuation?: { turnId: string; nextTurnId: string };
+}
 
 export interface WeixinView {
   state: 'disconnected' | 'pairing' | 'scanned' | 'verify' | 'connecting' | 'connected' | 'reconnecting' | 'expired' | 'unavailable';

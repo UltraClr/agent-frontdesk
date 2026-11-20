@@ -83,12 +83,13 @@ export interface GroupDelivery {
   kind: 'member' | 'host' | 'report';
   state: 'queued' | 'sent' | 'waiting' | 'blocked' | 'done';
   nativeTurn: string | null;
+  continuedAtTurn?: string;
   awaitingOutcome?: boolean;
   dispatched: number | null;
   note: string;
   taskId?: string;
   taskRevision?: number;
-  outcome?: 'completed' | 'failed' | 'interrupted' | 'cancelled';
+  outcome?: 'completed' | 'failed' | 'interrupted' | 'continued' | 'cancelled';
   memberId?: string;
   creatingMember?: boolean;
   removedMember?: string;
@@ -101,7 +102,7 @@ export type GroupDispatchStep = { member: string; deliveryId: string; parallelBa
 export interface GroupTask {
   id: string;
   revision: number;
-  state: 'queued' | 'confirming' | 'running' | 'waiting' | 'blocked' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed';
+  state: 'queued' | 'confirming' | 'running' | 'waiting' | 'blocked' | 'paused' | 'completed' | 'partial' | 'continued' | 'cancelled' | 'failed';
   request: string;
   dispatchPlan: GroupDispatchStep[];
   deliveries: GroupDelivery[];

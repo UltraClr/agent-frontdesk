@@ -4,7 +4,7 @@ import { get, messageOf, str } from '../../shared/guards.js';
 import { answer, request } from './api.js';
 import { say, t } from './i18n.js';
 import { character, escape, hydrateIcons, icon, markdown } from './renderers.js';
-import { GroupWorkflowDialog } from './group-workflow.js';
+import { GroupWorkflowDialog, receiptOutcomes } from './group-workflow.js';
 
 type Page = { items: GroupSummary[]; nextOffset: number | null };
 type Agent = { id: string; label: string };
@@ -13,9 +13,8 @@ type Draft = { text: string; member: string; replyTo: string; quoteLabel?: strin
 const activeTaskStates = new Set(['queued', 'confirming', 'running', 'waiting', 'blocked', 'paused']);
 const taskLabels = {
   queued: '等待投递', confirming: '正在确认桌面记录', running: '正在推进', waiting: '等待用户操作', blocked: '群任务受阻',
-  paused: '群任务已暂停', completed: '群任务已完成', partial: '部分成员已完成', cancelled: '已停止后续派发', failed: '群任务未完成',
+  paused: '群任务已暂停', completed: '群任务已完成', partial: '部分成员已完成', continued: '已在原会话续接', cancelled: '已停止后续派发', failed: '群任务未完成',
 } as const;
-const receiptOutcomes = { completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止', cancelled: '已撤销待投递消息' } as const;
 const taskTone = (state: string) => state === 'completed' ? 'positive'
   : ['waiting', 'confirming', 'paused'].includes(state) ? 'warning'
     : ['failed', 'blocked', 'interrupted'].includes(state) ? 'negative'
@@ -491,7 +490,7 @@ export class GroupPanel {
       : item.state === 'blocked' ? '未投递' : item.creatingMember ? item.state === 'queued' ? '等待新建成员会话' : '正在确认新会话'
         : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作'
           : item.awaitingOutcome ? '正在确认原生轮次结果' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
-    const href = item.creatingMember || !item.target ? '' : escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined));
+    const href = item.creatingMember || !item.target ? '' : escape(nativeLink(item.engine, item.target, item.continuedAtTurn || item.nativeTurn || undefined));
     const target = href ? `<a data-group-link href="${href}">${escape(label)}${icon('arrow-up-right')}</a>` : escape(label);
     const retry = item.state === 'blocked' && !room.paused ? `<button type="button" data-group-delivery-retry="${escape(item.id)}">${t('重试投递')}</button>` : '';
     const revision = showRevision && item.taskRevision !== undefined ? t('第 {n} 版', { n: item.taskRevision }) : '';

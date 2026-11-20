@@ -105,6 +105,8 @@ const EN: Record<string, string> = {
   '发给 {member} 的任务受阻': 'Dispatch to {member} is blocked',
   '正在确认发给 {member} 的消息': 'Confirming delivery to {member}',
   '正在确认原生轮次结果': 'Checking the outcome of the native turn',
+  '已在原会话续接': 'Continued in the original chat',
+  '这一轮已在原会话续接，打开原会话查看后续结果': 'This turn continued in the original chat. Open it to see the follow-up.',
   '等待派发给 {member}': 'Waiting to send to {member}',
   '群任务已暂停': 'Group task paused', '群任务已完成': 'Group task completed', '已停止后续派发': 'Further dispatches stopped', '群任务未完成': 'Group task incomplete',
   '原生轮次已结束': 'Desktop turn ended', '投递记录已结束': 'Delivery record closed', '已撤销待投递消息': 'Unsent message withdrawn',

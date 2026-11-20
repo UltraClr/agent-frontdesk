@@ -122,6 +122,49 @@ test('parallel branches survive restart, report partial results and request one 
   assert.equal(fixture.sent.length, 4);
 });
 
+test('a receipt continued in the native chat closes the pending item without importing or dispatching', async t => {
+  for (const parallel of [false, true]) await t.test(parallel ? 'parallel sibling still finishes' : 'serial successor stays unsent', async t => {
+    const fixture = setup(t);
+    let groups = await fixture.reopen();
+    const { id } = await fixture.create(fixture.codex, 'native-steer');
+    await groups.poll();
+    groups.send(id, { key: 'task', text: 'Ask two members and summarize', allowParallel: parallel });
+    await groups.poll();
+    fixture.finish(0, groupAction({ action: 'collect', mode: parallel ? 'parallel' : 'sequential', summarize: true,
+      questions: [{ member: 'A', text: 'First check' }, { member: 'B', text: 'Second check' }] }));
+    await groups.poll(); await groups.poll();
+    const sent = must(fixture.sent[1]);
+    const history = must(fixture.histories.get(sent.target));
+    const old = new UnifiedTurn({ id: 'original', status: 'unknown', userPrompt: sent.prompt });
+    history.turns.push(old, turn('steer', 'Private steer', 'Private follow-up result'));
+    await groups.poll();
+    assert.equal(groups.inbox().some(item => item.kind === 'delivery' && item.turnId === 'original'), true);
+
+    history.receiptContinuation = { turnId: old.id, nextTurnId: 'steer' };
+    groups = await fixture.reopen(true);
+    await groups.poll();
+    if (parallel) {
+      assert.equal(groups.view(id).pending, 1);
+      fixture.finish(2, 'Other member result');
+      await groups.poll(); await groups.poll();
+    }
+    const task = must(groups.progress(id));
+    const delivery = must(task.deliveries.find(item => item.target === 'A'));
+    assert.equal(task.state, parallel ? 'partial' : 'continued');
+    assert.equal(delivery.outcome, 'continued');
+    assert.equal(delivery.nativeTurn, 'original');
+    assert.equal(delivery.continuedAtTurn, 'steer');
+    assert.equal(groups.view(id).pending, 0);
+    assert.equal(groups.inbox().length, 0);
+    assert.equal(groups.view(id).messages.some(item => item.text.includes('Private follow-up result')), false);
+    const entry = must(groups.results(id, task.id, task.revision).entries.find(item => item.delivery?.id === delivery.id));
+    assert.equal(entry.message?.native?.turn, 'steer');
+    assert.equal(entry.message?.kind, 'notice');
+    await groups.poll();
+    assert.equal(fixture.sent.length, parallel ? 3 : 2);
+  });
+});
+
 test('an unapproved parallel request falls back to sequential collection', async t => {
   const fixture = setup(t), groups = await fixture.reopen();
   const { id } = await fixture.create(fixture.codex, 'serial');
