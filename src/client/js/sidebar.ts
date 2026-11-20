@@ -1,7 +1,7 @@
 import { t } from './i18n.js';
 import { get, isBag } from '../../shared/guards.js';
 import type { SessionGroup, SessionMetadata, Space, TimeValue, UnifiedSession } from '../../shared/contract.js';
-import type { StoreLike } from './navigation.js';
+import { sessionDisplayTitle, type StoreLike } from './navigation.js';
 // The session sidebar every engine shares: a "项目" section (one folder row per project,
 // folded until the person opens it, and remembered after that) and a "最近" section below it
 // with every chat, newest first, those in a project included (each marked with its project's
@@ -186,7 +186,8 @@ export function renderSidebar<S extends SideSession>(sessions: S[], { projects: 
     const mark = wait ? `<span class="side-wait">${t(wait)}</span>` : flags.running ? ("<span class=\"side-dot is-running\" aria-label=\"" + t('正在运行') + "\"></span>")
       : unread ? ("<span class=\"side-dot is-attention\" aria-label=\"" + t('需要查看') + "\"></span>")
       : `<time class="side-time">${escape(time(session))}</time>`;
-    return `<button type="button" class="session-row side-row${child ? ' is-child' : ''}${flags.running ? ' is-running' : ''}${unread ? ' is-unread' : ''}" data-session="${escape(session.id)}" aria-current="${currentId === session.id}" title="${escape(session.title || '')}"><span class="session-name">${escape(session.title || t('未命名聊天'))}</span>${project ? `<span class="side-project-tag" title="${escape(project.name)}">${escape(project.name)}</span>` : ''}${flags.draft ? ("<span class=\"draft-label\">" + t('草稿') + "</span>") : ''}${mark}</button>`;
+    const title = escape(sessionDisplayTitle(session, t('未命名聊天')));
+    return `<button type="button" class="session-row side-row${child ? ' is-child' : ''}${flags.running ? ' is-running' : ''}${unread ? ' is-unread' : ''}" data-session="${escape(session.id)}" aria-current="${currentId === session.id}" title="${title}"><span class="session-name">${title}</span>${project ? `<span class="side-project-tag" title="${escape(project.name)}">${escape(project.name)}</span>` : ''}${flags.draft ? ("<span class=\"draft-label\">" + t('草稿') + "</span>") : ''}${mark}</button>`;
   };
   const holds = (entry: SideEntry<S>) => entry.session.id === currentId || entry.children.some(kid => kid.id === currentId);
   // A long list shows its newest rows and a "show more" line; the open session always stays in view.

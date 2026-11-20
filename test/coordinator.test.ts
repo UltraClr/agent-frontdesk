@@ -95,6 +95,9 @@ test('opening controllers is lazy and restores each native session in its own pr
   }
   const ordinary = await (await fetch(new URL('/api/sessions?engine=first', base))).json();
   assert.deepEqual(ordinary, { first: [] });
+  const coordinatorHistory = await (await fetch(new URL('/api/sessions/first/control', base))).json();
+  assert.deepEqual(coordinatorHistory.session.metadata.frontdeskRole, { kind: 'coordinator' });
+  assert.equal(must(must(histories.get('first:control')).session).metadata.frontdeskRole, undefined);
   const cold = new Coordinator(host, runs);
   t.after(() => cold.dispose());
   await assert.rejects(cold.open(a), withStatus(423));

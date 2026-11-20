@@ -281,8 +281,18 @@ export class Coordinator {
 
   async readSession(engineId: string, id: string): Promise<History> {
     const engine = this.host.get(engineId);
-    if (engine.coordinator && this.isSession(engineId, id)) return engine.coordinator.read(id);
-    return engine.read(id);
+    const adapter = this.isSession(engineId, id) ? engine.coordinator : undefined;
+    const history = await (adapter ? adapter.read(id) : engine.read(id));
+    if (!history.session) return history;
+    const role = adapter && matchesFolder(history.session.cwd, this.directory(engine))
+      ? { kind: 'coordinator' } as const : this.groupSessionRoles(engineId, id)?.get(id);
+    return role ? { ...history, session: { ...history.session, metadata: { ...history.session.metadata, frontdeskRole: role } } } : history;
+  }
+
+  groupSessionRoles(engineId: string, sessionId?: string) {
+    // Group directory availability must not affect access to ordinary desktop chats.
+    try { return this.groups?.sessionRoles(engineId, sessionId); }
+    catch { return undefined; }
   }
 
   async messageInput(engine: Engine, id: string, input: SendInput): Promise<SendInput> {
@@ -396,7 +406,7 @@ export class Coordinator {
       state.attempt = randomUUID();
       this.persist(engine, state);
       try {
-        const created = await createNative({ ...input, model, cwd, space: undefined, projectId: undefined, title: 'Frontdesk Coordinator', prompt: `${this.instructions(state.attempt)}\n\nUser request:\n${input.prompt}` });
+        const created = await createNative({ ...input, model, cwd, space: undefined, projectId: undefined, title: `「总控」${engine.label}`, prompt: `${this.instructions(state.attempt)}\n\nUser request:\n${input.prompt}` });
         if (!await this.valid(engine, created.id)) throw unavailable('正在确认总控会话', 504);
         this.bindState(engine, state, created.id);
         return created;

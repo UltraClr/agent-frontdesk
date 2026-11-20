@@ -1,6 +1,17 @@
 import { promptStarts, type TurnMark } from '../../shared/turn-match.js';
 import { t, say } from './i18n.js';
-import type { ActivityEntry, CoordinatorTaskSummary, TimeValue, Usage } from '../../shared/contract.js';
+import type { ActivityEntry, CoordinatorTaskSummary, SessionMetadata, TimeValue, Usage } from '../../shared/contract.js';
+
+export function sessionDisplayTitle(item: { title?: string; metadata?: Pick<SessionMetadata, 'frontdeskRole'> } | null | undefined, fallback: string): string {
+  const title = item?.title || fallback;
+  const role = item?.metadata?.frontdeskRole;
+  if (!role) return title;
+  const key = role.kind === 'coordinator' ? '「总控」' : role.kind === 'group-host' ? '「群聊」' : '「{name}」';
+  const prefix = t(key, { name: 'group' in role ? role.group : '' });
+  const nativePrefix = role.kind === 'group-member' ? role.nativeTitlePrefix || `「${role.group}」` : key;
+  if (title.startsWith(prefix)) return title;
+  return prefix + (title.startsWith(nativePrefix) ? title.slice(nativePrefix.length).trimStart() : title);
+}
 
 export const viewKey = (engine: string, sessionId: string | null = null): string => JSON.stringify([engine, sessionId]);
 /** Whether a key (as viewKey writes it) is one of this engine's views. */

@@ -135,6 +135,9 @@ export interface SpacePlacement { group?: SessionGroup | null; rank?: number }
 
 export type WaitingFor = 'approval' | 'input' | 'plan';
 
+export type FrontdeskSessionRole = { kind: 'coordinator' } | { kind: 'group-host'; group: string }
+  | { kind: 'group-member'; group: string; nativeTitlePrefix?: string };
+
 export interface SessionMetadata {
   waitingFor?: WaitingFor;
   /** Position in the desktop’s pinned chats, starting at zero. */
@@ -155,6 +158,8 @@ export interface SessionMetadata {
   contentUnavailable?: string;
   /** A chat read from the desktop window that was not read whole. */
   readFromDesktop?: { read: number; total: number } | true;
+  /** Frontdesk's role for this native session, independent of its desktop title. */
+  frontdeskRole?: FrontdeskSessionRole;
   /** Engine-specific extras the page does not read. Values stay unknown on purpose. */
   [extra: string]: unknown;
 }

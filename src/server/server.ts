@@ -29,7 +29,7 @@ import { revealFile, fileManager } from './services/reveal.js';
 import { markTyping } from './core/desktop-automation.js';
 import { arr, errorField, get, list, messageOf, str } from '../shared/guards.js';
 import { sameTurn } from '../shared/turn-match.js';
-import type { BridgeConfig, CreateInput, EnginesResponse, CreateResult, DesktopSettings, Engine, NewControl, SendInput, UnifiedSession, WrapUpCard } from '../shared/contract.js';
+import type { BridgeConfig, CreateInput, EnginesResponse, CreateResult, DesktopSettings, Engine, NewControl, SendInput, SessionMetadata, UnifiedSession, WrapUpCard } from '../shared/contract.js';
 
 // The engine a route's :engine names, found once by app.param (express keeps it on the request).
 declare module 'express-serve-static-core' { interface Request { engine?: Engine } }
@@ -37,7 +37,7 @@ const engineOf = (req: Request): Engine => { if (!req.engine) throw Object.assig
 // What a caught value says, without assuming it is an Error: its status (else `fallback`) and message.
 const statusOf = (err: unknown, fallback = 500): number => Number(errorField(err, 'status')) || fallback;
 /** A chat just created here, listed until its engine lists it. */
-type Draft = CreateResult & { engine: string; cwd: string; title: string; updatedAt: string };
+type Draft = CreateResult & { engine: string; cwd: string; title: string; updatedAt: string; metadata?: SessionMetadata };
 export interface AppOptions { config?: BridgeConfig; host?: PluginHost; hub?: EventHub; weixin?: { file: string; api: WeixinApi; interval?: number } }
 
 async function createApp({ config = loadConfig(), host: given, hub = new EventHub(), weixin: channel }: AppOptions = {}) {
@@ -94,14 +94,17 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     if (method !== 'list') return engine[method]();
     // Without the recent replies each engine attaches for the activity feed (ActivityFeed asks the
     // engine itself): the page never reads them, and they were most of a list's bytes.
-    const result: Array<UnifiedSession | Draft> = (await engine.list()).filter(session => !coordinator.isProject(engine, session.cwd)).map(session => {
-      if (!session.metadata?.recentMessages) return session;
-      const { recentMessages: _, ...metadata } = session.metadata;
-      return { ...session, metadata };
-    });
+    const result: Array<UnifiedSession | Draft> = (await engine.list()).filter(session => !coordinator.isProject(engine, session.cwd));
     const ids = new Set(result.map(item => item.id));
     for (const draft of drafts.values()) if (draft.engine === engine.id && !ids.has(draft.id) && !coordinator.isProject(engine, draft.cwd)) result.unshift(draft);
-    return result;
+    const roles = coordinator.groupSessionRoles(engine.id);
+    return result.map(session => {
+      const role = roles?.get(session.id);
+      if (!role && !session.metadata?.recentMessages) return session;
+      const { recentMessages: _, ...metadata } = session.metadata || {};
+      if (role) metadata.frontdeskRole = role;
+      return { ...session, metadata };
+    });
   };
   const collect = async (method: 'status' | 'models' | 'list', selected?: unknown) => Object.fromEntries(await Promise.all(
     (selected ? [host.get(String(selected))] : [...host.engines.values()]).map(async engine => {
@@ -292,7 +295,8 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     catch (err) {
       const draft = drafts.get(hub.key(engine, id));
       if (!draft) throw err;
-      history = { session: draft, turns: [] };
+      const role = coordinator.groupSessionRoles(target.id, id)?.get(id);
+      history = { session: role ? { ...draft, metadata: { ...draft.metadata, frontdeskRole: role } } : draft, turns: [] };
     }
     if (history.session) history.session.sendBlocked = history.session.sendBlocked || await sendBlocked(target, id);
     const active = runs.get(engine, id);

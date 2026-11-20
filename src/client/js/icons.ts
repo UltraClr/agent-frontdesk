@@ -12,7 +12,9 @@ import ArrowRight from 'lucide/dist/esm/icons/arrow-right.js';
 import ArrowUp from 'lucide/dist/esm/icons/arrow-up.js';
 import ArrowUpRight from 'lucide/dist/esm/icons/arrow-up-right.js';
 import AtSign from 'lucide/dist/esm/icons/at-sign.js';
+import BookmarkPlus from 'lucide/dist/esm/icons/bookmark-plus.js';
 import BookOpen from 'lucide/dist/esm/icons/book-open.js';
+import Bot from 'lucide/dist/esm/icons/bot.js';
 import Check from 'lucide/dist/esm/icons/check.js';
 import ChevronDown from 'lucide/dist/esm/icons/chevron-down.js';
 import ChevronRight from 'lucide/dist/esm/icons/chevron-right.js';
@@ -42,6 +44,7 @@ import MessageSquareQuote from 'lucide/dist/esm/icons/message-square-quote.js';
 import MessagesSquare from 'lucide/dist/esm/icons/messages-square.js';
 import Mic from 'lucide/dist/esm/icons/mic.js';
 import MonitorSmartphone from 'lucide/dist/esm/icons/monitor-smartphone.js';
+import Network from 'lucide/dist/esm/icons/network.js';
 import PanelLeft from 'lucide/dist/esm/icons/panel-left.js';
 import PanelLeftClose from 'lucide/dist/esm/icons/panel-left-close.js';
 import PanelRight from 'lucide/dist/esm/icons/panel-right.js';
@@ -63,9 +66,9 @@ import X from 'lucide/dist/esm/icons/x.js';
 
 // By the name lucide gives each icon ("file-check-2" is "FileCheck2"): replaceElement looks them up so.
 const drawn: Record<string, unknown> = {
-  AppWindow, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, AtSign, BookOpen, Check, ChevronDown, ChevronRight, ChevronsRight, CircleAlert, CircleStop, Clock3, Code, Copy,
+  AppWindow, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, AtSign, BookmarkPlus, BookOpen, Bot, Check, ChevronDown, ChevronRight, ChevronsRight, CircleAlert, CircleStop, Clock3, Code, Copy,
   Download, Ellipsis, ExternalLink, File, FileCheck2, FileText, Folder, FolderOpen, FolderSearch, GripVertical, History, Info, ListChecks, ListFilter, ListPlus,
-  Mail, MessageSquareQuote, MessagesSquare, Mic, MonitorSmartphone, PanelLeft, PanelLeftClose, PanelRight, Pencil, Plus, RefreshCw, ScanLine, Search, Send,
+  Mail, MessageSquareQuote, MessagesSquare, Mic, MonitorSmartphone, Network, PanelLeft, PanelLeftClose, PanelRight, Pencil, Plus, RefreshCw, ScanLine, Search, Send,
   Settings, Sparkles, Square, SquarePen, Terminal, TextCursorInput, UsersRound, Wrench, X,
 };
 const named = (name: string): string => name.replace(/(\w)(\w*)(_|-|\s*)/g, (_all, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase());

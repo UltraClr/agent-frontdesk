@@ -14,6 +14,10 @@ const taskLabels = {
   paused: '群任务已暂停', completed: '群任务已完成', cancelled: '已停止后续派发', failed: '群任务未完成',
 } as const;
 const receiptOutcomes = { completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止', cancelled: '已撤销待投递消息' } as const;
+const taskTone = (state: string) => state === 'completed' ? 'positive'
+  : ['waiting', 'confirming', 'paused'].includes(state) ? 'warning'
+    : ['failed', 'blocked', 'interrupted'].includes(state) ? 'negative'
+      : ['running', 'sent'].includes(state) ? 'active' : 'neutral';
 type HostChoice = { engine: string; hostSession?: string };
 const enc = encodeURIComponent;
 const api = '/api/groups';
@@ -202,17 +206,29 @@ export class GroupPanel {
         <button type="button" class="group-back" data-group-back aria-label="${t('返回总控')}" title="${t('返回总控')}">${icon('arrow-left')}</button>
         <span class="group-emblem" aria-hidden="true">${icon('users-round')}</span>
         <div class="group-heading"><h1></h1><p class="group-topic"></p></div>
-        <div class="group-tools"><button type="button" data-group-manage>${t('管理成员')}</button><button type="button" data-group-rename>${t('重命名')}</button><button type="button" data-group-pin></button><button type="button" data-group-pause></button></div>
+        <div class="group-tools">
+          <button type="button" class="group-manage" data-group-manage>${icon('users-round')}<span>${t('管理成员')}</span></button>
+          <details class="group-more">
+            <summary aria-label="${t('更多群聊操作')}" title="${t('更多群聊操作')}">${icon('ellipsis')}</summary>
+            <div class="group-more-actions">
+              <button type="button" data-group-rename>${icon('pencil')}<span>${t('重命名')}</span></button>
+              <button type="button" data-group-pin></button>
+              <button type="button" data-group-pause></button>
+            </div>
+          </details>
+        </div>
       </header>
       <div class="group-members"></div><div class="group-status" role="status"></div>
       <div class="group-task-panel" hidden></div>
       <section class="group-messages" aria-label="${t('群聊')}" tabindex="0"></section>
       <form class="group-composer">
         <div class="group-quote" hidden></div>
-        <label>${icon('at-sign')}<span>${t('发送给')}</span><select aria-label="${t('收件人')}"></select></label>
-        <label data-group-task-action hidden><span>${t('任务操作')}</span><select aria-label="${t('任务操作')}"></select></label>
         <textarea required maxlength="12000" aria-label="${t('发送群消息')}" placeholder="${t('发送群消息')}"></textarea>
-        <button class="primary-button" type="submit">${t('发送')}</button>
+        <div class="group-composer-toolbar">
+          <label><span>${t('发送给')}</span><span class="group-select">${icon('at-sign')}<select aria-label="${t('收件人')}"></select>${icon('chevron-down')}</span></label>
+          <label data-group-task-action hidden><span>${t('任务操作')}</span><span class="group-select"><select aria-label="${t('任务操作')}"></select>${icon('chevron-down')}</span></label>
+          <button class="primary-button group-send" type="submit">${icon('arrow-up')}<span>${t('发送')}</span></button>
+        </div>
       </form>
       <dialog class="group-dialog"></dialog>`;
     this.title = panel.querySelector('h1')!;
@@ -245,6 +261,12 @@ export class GroupPanel {
       void this.refreshDirectory();
     });
     panel.addEventListener('click', event => void this.action(event));
+    panel.addEventListener('keydown', event => {
+      const menu = (event.target as Element | null)?.closest<HTMLDetailsElement>('.group-more[open]');
+      if (event.key !== 'Escape' || !menu) return;
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
+    });
     this.input.addEventListener('input', () => { this.draft.key = undefined; this.save(); });
     this.receiver.addEventListener('change', () => this.changeRecipient());
     this.taskAction.addEventListener('change', () => {
@@ -287,20 +309,23 @@ export class GroupPanel {
     const rows = this.page.items.map(room => {
       const unread = room.latest > Number(getLocal('frontdesk:group:read:' + room.id) || 0);
       const faces = room.members.slice(0, 3).map(member => this.face(member.engine)).join('');
-      return `<button class="group-row" type="button" data-room="${escape(room.id)}" aria-current="${room.id === this.id}">
+      return `<button class="group-row" type="button" data-room="${escape(room.id)}" aria-current="${room.id === this.id}" title="${escape(room.name)}">
         <span class="group-row-icon">${icon('messages-square')}</span>
         <span class="group-row-copy"><strong>${escape(room.name)}</strong><small>${escape(room.topic || t('{n} 位成员', { n: room.members.length }))}</small></span>
         <span class="group-row-meta">${room.pending ? `<span class="group-pending" aria-label="${t('{n} 项进行中', { n: room.pending })}">${room.pending}</span>`
-          : unread ? '<span class="group-unread"></span>' : `<span class="group-face-stack" aria-hidden="true">${faces}</span>`}</span></button>`;
+          : faces ? `<span class="group-face-stack" aria-hidden="true">${faces}</span>` : ''}
+          ${unread ? `<span class="group-unread" title="${t('未读')}"></span>` : ''}</span></button>`;
     }).join('');
     const block = document.createElement('div');
     block.innerHTML = (rows || (this.loaded ? `<p class="group-directory-empty">${t(this.query ? '没有匹配的群聊' : '还没有群聊')}</p>` : '')) + (this.page.nextOffset !== null ? `<button type="button" data-group-next>${t('更多群聊')}</button>` : '');
     if (!this.list.querySelector('form')) this.list.append(filter);
     if (this.offset) block.insertAdjacentHTML('afterbegin', `<button type="button" data-group-previous>${t('上一页')}</button>`);
     if (block.innerHTML !== this.directoryMarkup || !this.list.querySelector('div')) {
+      const focused = this.list.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset['room'] : undefined;
       this.list.querySelector('div')?.remove();
       this.list.append(block);
       this.directoryMarkup = block.innerHTML;
+      if (focused) block.querySelector<HTMLButtonElement>(`[data-room="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });
     }
     hydrateIcons(this.list);
   }
@@ -316,6 +341,7 @@ export class GroupPanel {
       setLocal('frontdesk:group:anchor:' + this.id, visible?.dataset['messageId'] || '');
     }
     this.id = '';
+    this.panel.querySelector('.group-more')?.removeAttribute('open');
     this.roomGeneration++;
     this.room = undefined;
     this.panel.hidden = true;
@@ -381,7 +407,7 @@ export class GroupPanel {
 
   private render(room: GroupView) {
     const first = !this.room;
-    const hostChanged = room.engine !== this.room?.engine || room.sessionId !== this.room?.sessionId;
+    const hostChanged = room.engine !== this.room?.engine || room.sessionId !== this.room?.sessionId || room.hostTitle !== this.room?.hostTitle;
     const membersChanged = room.members.length !== this.room?.members.length || room.members.some((member, index) => {
       const previous = this.room?.members[index];
       return !previous || memberKey(previous) !== memberKey(member) || previous.alias !== member.alias;
@@ -414,7 +440,7 @@ export class GroupPanel {
     const pause = this.panel.querySelector<HTMLButtonElement>('[data-group-pause]')!;
     pause.textContent = t(room.paused ? '继续群聊' : '暂停群聊');
     this.form.hidden = room.state !== 'ready' || room.paused;
-    const options = `<option value="">${t('群主')} · ${escape(hostLabel)}</option>` + room.members.map(member => `<option value="${escape(memberKey(member))}">@${escape(member.alias)}</option>`).join('');
+    const options = `<option value="">${t('群主')} · ${escape(hostLabel)}</option>` + room.members.map(member => `<option value="${escape(memberKey(member))}">${escape(member.alias)}</option>`).join('');
     if (hostChanged || membersChanged) {
       const selected = this.receiver.selectedIndex === -1 ? this.draft.member : this.receiver.value;
       this.receiver.innerHTML = options;
@@ -428,7 +454,7 @@ export class GroupPanel {
     const rows = [...distinct.values()].map(message => this.renderMessage(message, distinct)).join('');
     const waiting = room.deliveries.filter(item => !room.task || item.taskId !== room.task.id).map(item => this.renderDelivery(room, item)).join('');
     const empty = !rows && !waiting && room.state === 'ready' ? `<div class="group-empty">${icon('messages-square')}<h2>${t('开始讨论')}</h2><p>${t('可以请群主组织讨论，也可以直接给某个成员发消息。')}</p></div>` : '';
-    this.timeline.innerHTML = (before ? `<button data-group-older type="button">${t('查看更早发言')}</button>` : '') + rows + waiting + empty;
+    this.timeline.innerHTML = (before ? `<button class="group-older" data-group-older type="button">${icon('history')}${t('查看更早发言')}</button>` : '') + rows + waiting + empty;
     this.renderTask(room);
     this.updateTaskAction();
     this.updateQuote();
@@ -446,25 +472,49 @@ export class GroupPanel {
     const state = item.outcome ? receiptOutcomes[item.outcome] : item.state === 'done' ? '投递记录已结束'
       : item.state === 'blocked' ? '未投递' : item.creatingMember ? item.state === 'queued' ? '等待新建成员会话' : '正在确认新会话'
         : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
-    const target = item.creatingMember || !item.target ? escape(label) : `<a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${escape(label)}</a>`;
+    const href = item.creatingMember || !item.target ? '' : escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined));
+    const target = href ? `<a data-group-link href="${href}">${escape(label)}${icon('arrow-up-right')}</a>` : escape(label);
     const retry = item.state === 'blocked' && !room.paused ? `<button type="button" data-group-delivery-retry="${escape(item.id)}">${t('重试投递')}</button>` : '';
-    const revision = showRevision && item.taskRevision !== undefined ? ` · ${t('第 {n} 版', { n: item.taskRevision })}` : '';
-    return `<div class="group-delivery">${icon('clock-3')}<span>${target}${item.removedMember ? ' · ' + t('已移出群聊') : ''}${revision} · ${t(state)}${item.attention ? ` · ${escape(say(item.attention.title))} · <a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${t('打开原会话处理')}</a>` : ''}${item.note ? ' · ' + escape(say(item.note)) : ''}</span>${retry}</div>`;
+    const revision = showRevision && item.taskRevision !== undefined ? t('第 {n} 版', { n: item.taskRevision }) : '';
+    const meta = [revision, item.removedMember ? t('已移出群聊') : ''].filter(Boolean).join(' · ');
+    const tone = taskTone(item.outcome || (item.state === 'sent' && !item.nativeTurn ? 'confirming' : item.state));
+    return `<div class="group-delivery">
+      <span class="group-delivery-face" aria-hidden="true">${this.face(item.engine)}</span>
+      <div class="group-delivery-copy"><strong>${target}</strong>${meta ? `<small>${meta}</small>` : ''}</div>
+      <span class="group-state-pill" data-tone="${tone}">${t(state)}</span>
+      ${item.attention || item.note || retry ? `<div class="group-delivery-detail">
+        ${item.attention ? `<span>${escape(say(item.attention.title))}</span>${href ? `<a data-group-link href="${href}">${t('打开原会话处理')}</a>` : ''}` : ''}
+        ${item.note ? `<span>${escape(say(item.note))}</span>` : ''}${retry}
+      </div>` : ''}</div>`;
   }
 
   private renderTask(room: GroupView) {
     const task = room.task;
     this.taskPanel.hidden = !task;
-    const markup = task ? `<details><summary><strong>${t('查看任务进度')}</strong><span>${t(taskLabels[task.state])}</span></summary>
-      <div class="group-task-body"><p>${escape(task.request)}</p>
+    const markup = task ? `<details><summary>
+      <span class="group-task-icon" aria-hidden="true">${icon('list-checks')}</span>
+      <span class="group-task-copy"><strong>${t('查看任务进度')}</strong>${task.request ? `<span class="group-task-request" title="${escape(task.request)}">${escape(task.request)}</span>` : ''}</span>
+      <span class="group-state-pill" data-tone="${taskTone(task.state)}">${t(taskLabels[task.state])}</span>
+      <span class="group-task-chevron" aria-hidden="true">${icon('chevron-down')}</span>
+      </summary><div class="group-task-body" tabindex="0">
+      ${task.request ? `<p class="group-task-full-request">${escape(task.request)}</p>` : ''}
       ${task.deliveries.map(item => this.renderDelivery(room, item, true)).join('')}
-      ${activeTaskStates.has(task.state) ? `<button type="button" data-group-task-cancel>${t('停止后续派发')}</button>` : ''}
+      ${activeTaskStates.has(task.state) ? `<button type="button" data-group-task-cancel>${icon('circle-stop')}${t('停止后续派发')}</button>` : ''}
       </div></details>` : '';
     if (this.taskMarkup === markup) return;
-    const open = this.taskPanel.querySelector('details')?.open || false;
+    const previous = this.taskPanel.querySelector('details');
+    const open = previous?.open || false;
+    const scroll = previous?.querySelector('.group-task-body')?.scrollTop || 0;
+    const focused = previous?.querySelector('summary') === document.activeElement;
     this.taskMarkup = markup;
     this.taskPanel.innerHTML = markup;
-    if (open && task) this.taskPanel.querySelector('details')!.open = true;
+    if (!task) return;
+    const details = this.taskPanel.querySelector('details')!;
+    if (open) {
+      details.open = true;
+      details.querySelector<HTMLElement>('.group-task-body')!.scrollTop = scroll;
+    }
+    if (focused) details.querySelector('summary')?.focus({ preventScroll: true });
   }
 
   private updateTaskAction() {
@@ -499,9 +549,11 @@ export class GroupPanel {
     const reply = message.replyTo && messages.get(message.replyTo);
     const author = message.kind === 'user' ? t('你') + ' → ' + (message.author || t('群主'))
       : message.kind === 'host' ? t('群主') : message.author;
+    const face = message.native?.engine && message.kind !== 'notice' ? this.face(message.native.engine)
+      : message.kind === 'host' && this.room ? this.face(this.room.engine) : '';
     const sources = (message.sources || []).map((id, index) => `<a data-group-link href="#group/${enc(this.id)}/${enc(id)}">${t('依据')} ${index + 1}</a>`).join('');
     return `<article class="group-message" data-kind="${message.kind}" data-message-id="${escape(message.id)}">
-      <header><strong>${escape(author || t('群聊'))}</strong>${message.taskRevision && message.taskRevision > 1 ? `<span>${t('第 {n} 版', { n: message.taskRevision })}</span>` : ''}${message.decision ? `<span>${t('结论')}</span>` : ''}</header>
+      <header>${face ? `<span class="group-message-face" aria-hidden="true">${face}</span>` : ''}<strong>${escape(author || t('群聊'))}</strong>${message.taskRevision && message.taskRevision > 1 ? `<span class="group-message-tag">${t('第 {n} 版', { n: message.taskRevision })}</span>` : ''}${message.decision ? `<span class="group-message-tag is-decision">${t('结论')}</span>` : ''}</header>
       ${reply ? `<blockquote>${escape(reply.text.slice(0, 150))}</blockquote>` : ''}
       <div class="markdown">${markdown(message.kind === 'notice' || !message.native && message.kind === 'member' ? say(message.text) : message.text)}</div>
       <footer>${sources}${message.replaces ? `<a data-group-link href="#group/${enc(this.id)}/${enc(message.replaces)}">${t('查看被取代的结论')}</a>` : ''}
@@ -524,7 +576,8 @@ export class GroupPanel {
     quote.hidden = !this.draft.replyTo;
     if (!quote.hidden) {
       const message = [...this.older, ...(this.room?.messages || [])].find(item => item.id === this.draft.replyTo);
-      quote.innerHTML = `<span>${escape(message?.text.slice(0, 130) || t('引用发言'))}</span><button type="button" data-group-unquote>${t('移除引用')}</button>`;
+      quote.innerHTML = `${icon('message-square-quote')}<span>${escape(message?.text.slice(0, 130) || t('引用发言'))}</span><button type="button" data-group-unquote title="${t('移除引用')}" aria-label="${t('移除引用')}">${icon('x')}</button>`;
+      hydrateIcons(quote);
     }
   }
 
@@ -562,6 +615,12 @@ export class GroupPanel {
   }
 
   private async action(event: MouseEvent) {
+    const menu = this.panel.querySelector<HTMLDetailsElement>('.group-more');
+    if (menu?.open && !(event.target as Element | null)?.closest('.group-more > summary')) {
+      const restoreFocus = menu.contains(document.activeElement);
+      menu.open = false;
+      if (restoreFocus) menu.querySelector('summary')?.focus({ preventScroll: true });
+    }
     const link = (event.target as Element | null)?.closest<HTMLAnchorElement>('a[data-group-link]');
     if (link && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
       event.preventDefault();

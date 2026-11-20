@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import type { CreateInput, CreateResult, Engine, TimeValue, UnifiedSession, UnifiedTurn } from '../../shared/contract.js';
+import type { CreateInput, CreateResult, Engine, FrontdeskSessionRole, TimeValue, UnifiedSession, UnifiedTurn } from '../../shared/contract.js';
 import type { GroupDelivery, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupState, GroupSummary, GroupTask, GroupView } from '../../shared/groups.js';
 import { errorField, failure, get, list, messageOf, str } from '../../shared/guards.js';
 import { promptStarts } from '../../shared/turn-match.js';
@@ -44,6 +44,7 @@ interface GroupRecord {
 
 interface Work extends GroupDelivery {
   nativeCandidate?: string;
+  nativeTitlePrefix?: string;
   initialMember?: boolean;
   enrollment?: string;
   formerMember?: GroupMember;
@@ -363,14 +364,29 @@ export class Groups {
     return this.view(id);
   }
 
-  private dedicatedIds(engine: string): Set<string> {
-    return new Set(this.store().prepare(`SELECT json_extract(value,'$.sessionId') AS id FROM rooms, json_each(rooms.data,'$.members')
-      WHERE json_extract(value,'$.engine')=? AND json_extract(value,'$.dedicated')=1`).all(engine).flatMap(row => str(row.id) || []));
+  private dedicatedRows(engine: string, id?: string) {
+    return this.store().prepare(`SELECT json_extract(value,'$.sessionId') AS id, json_extract(rooms.data,'$.name') AS name,
+      json_extract(value,'$.nativeTitlePrefix') AS nativeTitlePrefix FROM rooms, json_each(rooms.data,'$.members')
+      WHERE json_extract(value,'$.engine')=? AND json_extract(value,'$.dedicated')=1${id === undefined ? '' : " AND json_extract(value,'$.sessionId')=?"}`).all(engine, ...(id === undefined ? [] : [id]));
   }
 
   scopedSessionIds(engine: string): Set<string> {
-    if (!this.db && !fs.existsSync(this.file)) return new Set();
-    return new Set([...this.hostedIds(engine), ...this.dedicatedIds(engine)]);
+    return new Set(this.sessionRoles(engine).keys());
+  }
+
+  /** The directory already owns these bindings, so there is no need to load native history. */
+  sessionRoles(engine: string, sessionId?: string): Map<string, FrontdeskSessionRole> {
+    const roles = new Map<string, FrontdeskSessionRole>();
+    if (!this.db && !fs.existsSync(this.file)) return roles;
+    for (const row of this.dedicatedRows(engine, sessionId)) {
+      const id = str(row.id), group = str(row.name), nativeTitlePrefix = str(row.nativeTitlePrefix);
+      if (id && group) roles.set(id, { kind: 'group-member', group, ...(nativeTitlePrefix ? { nativeTitlePrefix } : {}) });
+    }
+    for (const row of this.hostRows(engine, sessionId)) {
+      const id = str(row.id), group = str(row.name);
+      if (id && group) roles.set(id, { kind: 'group-host', group });
+    }
+    return roles;
   }
 
   async members(engineId: string, query: string) {
@@ -404,9 +420,10 @@ export class Groups {
     return name === engine.id + '-controller' || name === engine.id + '-group-hosts';
   }
 
-  private hostedIds(engine: string) {
-    const rows = this.store().prepare("SELECT json_extract(data,'$.sessionId') AS id FROM rooms WHERE native IS NOT NULL AND json_extract(data,'$.engine')=?").all(engine);
-    return new Set(rows.flatMap(row => str(row.id) || []));
+  private hostRows(engine: string, id?: string) {
+    const select = "SELECT json_extract(data,'$.sessionId') AS id, json_extract(data,'$.name') AS name FROM rooms";
+    return id === undefined ? this.store().prepare(select + " WHERE native IS NOT NULL AND json_extract(data,'$.engine')=?").all(engine)
+      : this.store().prepare(select + ' WHERE native=?').all(targetKey(engine, id));
   }
 
   private async hostSession(engine: Engine, sessionId: string) {
@@ -451,8 +468,8 @@ export class Groups {
         let catalog = catalogs.get(engineId);
         if (!catalog) { catalog = await adapter.catalog(); catalogs.set(engineId, catalog); }
         const candidate = catalog.find(candidate => candidate.id === id && !this.internal(target, candidate.cwd));
-        if ((engineId !== room.engine || id !== room.sessionId) && this.hostedIds(engineId).has(id)) throw failure('该会话已在其他群中担任群主或作为专用会话', { status: 409 });
-        if (candidate && this.dedicatedIds(engineId).has(candidate.id)) throw failure('这个会话已专用于另一个群聊', { status: 409 });
+        if ((engineId !== room.engine || id !== room.sessionId) && this.hostRows(engineId, id).length) throw failure('该会话已在其他群中担任群主或作为专用会话', { status: 409 });
+        if (candidate && this.dedicatedRows(engineId, candidate.id).length) throw failure('这个会话已专用于另一个群聊', { status: 409 });
         if (!candidate) throw failure('成员会话暂不可用', { status: 404 });
         const saved = known.find(member => member.id === id && member.engine === engineId);
         const alias = bounded(get(item, 'alias'), 80) || saved?.alias || candidate.title || id;
@@ -685,7 +702,7 @@ export class Groups {
     });
     if (!claimed) return;
     try {
-      const result = await this.createNative(engine, { cwd: room.directory, title: room.name, prompt: this.initPrompt(room), nativeCreationMarker: marker(room.id + '/setup'), model });
+      const result = await this.createNative(engine, { cwd: room.directory, title: `「群聊」${room.name}`, prompt: this.initPrompt(room), nativeCreationMarker: marker(room.id + '/setup'), model });
       if (!this.stopped) await this.bindHost(room, engine, result.id);
     } catch (error) {
       if (this.stopped) return;
@@ -1207,6 +1224,7 @@ export class Groups {
       const stored = workMember(room, live);
       if (!stored || stored.sessionId) return;
       stored.sessionId = hits[0]!.id;
+      if (live.nativeTitlePrefix) stored.nativeTitlePrefix = live.nativeTitlePrefix;
       stored.nativeSettings = nativeSettings(hits[0]!);
       live.target = stored.sessionId;
       live.note = '';
@@ -1240,10 +1258,11 @@ export class Groups {
       this.memberPreflightIssue(work, member, error, errorField(error, 'notSent') === true);
       return;
     }
+    work.nativeTitlePrefix = `「${room.name}」`;
     if (this.stopped || !this.claimWork(work, member)) return;
     try {
       const prompt = requiresPrompt ? this.makePrompt(room, work) : undefined;
-      const result = await this.createNative(engine, { cwd, title: member.title, prompt, model,
+      const result = await this.createNative(engine, { cwd, title: work.nativeTitlePrefix + member.alias, prompt, model,
         ...(requiresPrompt ? { nativeCreationMarker: marker(work.id) } : {}) }, work.id);
       if (this.stopped) return;
       const live = this.activeWork(work.id);

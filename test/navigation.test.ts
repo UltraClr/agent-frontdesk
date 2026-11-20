@@ -9,6 +9,22 @@ import type { ActivityEntry, ActivitySnapshot, RunTurn, SessionStatus, UnifiedSe
 import type { ActivityLike } from '../src/client/js/navigation.js';
 const storage = () => { const data = new Map<string, string>(); return { getItem: (key: string) => data.get(key) || null, setItem: (key: string, value: string) => data.set(key, value) }; };
 
+test('Frontdesk chat titles show the bound role without changing or duplicating the native title', async () => {
+  const { sessionDisplayTitle } = await import('../src/client/js/navigation.js');
+  const fallback = '未命名聊天';
+  assert.equal(sessionDisplayTitle({ title: '已有会话' }, fallback), '已有会话');
+  assert.equal(sessionDisplayTitle({ title: 'Codex', metadata: { frontdeskRole: { kind: 'coordinator' } } }, fallback), '「总控」Codex');
+  assert.equal(sessionDisplayTitle({ title: '「群聊」发布评审', metadata: { frontdeskRole: { kind: 'group-host', group: '发布评审' } } }, fallback), '「群聊」发布评审');
+  const member = { title: '验证脚本', metadata: { frontdeskRole: { kind: 'group-member' as const, group: '发布评审' } } };
+  assert.equal(sessionDisplayTitle(member, fallback), '「发布评审」验证脚本');
+  member.metadata.frontdeskRole.group = '发布验收';
+  assert.equal(sessionDisplayTitle(member, fallback), '「发布验收」验证脚本');
+  assert.equal(member.title, '验证脚本');
+  assert.equal(sessionDisplayTitle({ title: '「发布评审」验证脚本', metadata: {
+    frontdeskRole: { kind: 'group-member', group: '发布验收', nativeTitlePrefix: '「发布评审」' },
+  } }, fallback), '「发布验收」验证脚本');
+});
+
 test('coordinator sessions show the latest unfinished task per engine and session first', async () => {
   const { coordinatorTargets } = await import('../src/client/js/navigation.js');
   const tasks = [

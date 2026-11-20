@@ -117,6 +117,8 @@ Create a group from the coordinator sidebar or ask your coordinator to group the
 
 Use **Manage members** to add existing chats, set up dedicated members, or remove members after creating the group. Choose a member as the recipient to ask it directly. Choose the host for a multi-step discussion or summary. A decision links back to its native turn and can be reported explicitly to the current coordinator.
 
+Frontdesk labels the coordinator with `[Coordinator]`, group hosts with `[Group]`, and dedicated members with the group name. Search the session list by group name or label. Existing chats added as ordinary members keep their titles. Desktop apps control their own titles.
+
 The host continues in its own desktop chat. Ask it to consider member replies when needed, or use **Reply to this** to include a specific excerpt. Members receive their assigned question and relevant excerpts. If the same native chat participates in two groups, it remembers the tasks it received from both.
 
 Each group advances one host-led task at a time. Open **View task progress** to see deliveries and approvals without sending a desktop message. Choose **Add to current task** to give the host more requirements, or **Replace current task** to start a different task. **Stop further dispatches** keeps the receipts for turns already sent. Follow the desktop link to stop an already running turn. The host looks for replies from the current task by default. Use **Reply to this** to bring a specific message from earlier work.

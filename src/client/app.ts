@@ -4,7 +4,7 @@ import 'katex/dist/katex.min.css';
 import './style.css';
 import './kit/kit.css';
 import { t, say, locale, language, translateDocument } from './js/i18n.js';
-import { DraftBook, ReadMarkers, activityTime, readTime, visibleReplyTime, viewKey, isViewOf, preferredSession, quotaLabel, coordinatorTargets, deliveryReceipts } from './js/navigation.js';
+import { DraftBook, ReadMarkers, activityTime, readTime, visibleReplyTime, viewKey, isViewOf, preferredSession, quotaLabel, coordinatorTargets, deliveryReceipts, sessionDisplayTitle } from './js/navigation.js';
 import { createStore } from './js/store.js';
 import { request, answer, connect, sessionUrl, type RequestOptions } from './js/api.js';
 import { nativeDictation, browserDictation, VoiceUnavailable } from './js/dictation.js';
@@ -477,7 +477,13 @@ function renderSessionList() {
   const newWaiting: PageSession[] = view === 'waiting' ? state.activity.filter(item => item.engine === state.engine && item.waitingFor && !catalogIds.has(item.sessionId))
     .map(item => ({ id: item.sessionId, title: item.title || item.sessionId, engine: item.engine })) : [];
   // The waiting inbox spans this agent’s desktop modes, just like its badge.
-  const sessions = (view === 'waiting' ? [...catalog, ...newWaiting] : inSpace(catalog, spaces, shown)).filter(item => `${item.title} ${item.cwd} ${item.metadata?.group?.name || ''}`.toLocaleLowerCase().includes(query));
+  const sessions = (view === 'waiting' ? [...catalog, ...newWaiting] : inSpace(catalog, spaces, shown)).filter(item => {
+    if (!query) return true;
+    const title = sessionDisplayTitle(item, '');
+    const role = item.metadata?.frontdeskRole;
+    const room = role && 'group' in role ? role.group : '';
+    return `${title} ${item.cwd || ''} ${item.metadata?.group?.name || ''} ${room}`.toLocaleLowerCase().includes(query);
+  });
   const error = state.refreshErrors[state.engine] || (mode?.unavailable && !sessions.length ? mode.unavailable : ''), projects = inSpace(state.projects[state.engine] || [], spaces, shown);
   // A chat has news when it finished or said something since it was last opened here, or when the
   // desktop marks it for a look (metadata.attention) and it has not been opened here since.
@@ -576,7 +582,8 @@ function renderHeader() {
   // Engines on the shared chat kit (src/client/kit) get its layout; their brand colour drives its accents.
   const accent = engine()?.accent;
   if (accent) document.documentElement.style.setProperty('--engine-accent', accent); else document.documentElement.style.removeProperty('--engine-accent');
-  $('session-title').textContent = coordinatorMode ? t('总控') : state.session?.title || t('新建聊天');
+  $('session-title').textContent = coordinatorMode && state.session?.metadata?.frontdeskRole?.kind !== 'coordinator'
+    ? t('总控') : sessionDisplayTitle(state.session, t('新建聊天'));
   const directory = (coordinatorMode ? coordinatorView?.cwd : state.session?.cwd) || '';
   $('session-cwd').textContent = folderName(directory);
   $('session-cwd').title = directory;
@@ -760,7 +767,7 @@ function emptyView() {
   }
   // A chat the desktop lists whose messages are not on this computer in a form the console can read.
   const elsewhere = state.session.metadata?.contentUnavailable;
-  if (elsewhere) return `<div class="empty-conversation">${face}<div class="workspace-label">${icon('messages-square')}<span>${escape(engine()?.label || '')}${space() ? ` · ${escape(space()?.label)}` : ''}</span></div><h2>${escape(state.session?.title || t('聊天'))}</h2><p>${escape(say(elsewhere))}</p></div>`;
+  if (elsewhere) return `<div class="empty-conversation">${face}<div class="workspace-label">${icon('messages-square')}<span>${escape(engine()?.label || '')}${space() ? ` · ${escape(space()?.label)}` : ''}</span></div><h2>${escape(sessionDisplayTitle(state.session, t('聊天')))}</h2><p>${escape(say(elsewhere))}</p></div>`;
   return `<div class="empty-conversation">${face}<div class="workspace-label">${icon('messages-square')}<span>${escape(engine()?.label || t('本地引擎'))} ${t('工作台')}</span></div><h2>${t('从一条消息开始')}</h2><p>${t('说说你想完成的事。回复、执行进度和产物都会留在这里。')}</p><div class="empty-note">${icon('folder-open')}<span>${t('文件编辑留在原工作区，聊天负责调度与交付')}</span></div></div>`;
 }
 function receiptDetails(tasks: CoordinatorView['tasks']) {
@@ -1234,17 +1241,18 @@ function renderCoordinator() {
   const pane = $('coordinator-pane'), provider = engine();
   const choices = controllers.filter(item => item.controller && engine(item.id));
   const select = `<section class="coordinator-engine">
-    <div class="coordinator-mobile-heading mobile-only">
-      <button type="button" class="icon-button" data-coordinator-close aria-label="${t('关闭侧栏')}">${icon('panel-left-close')}</button>
-    </div>
-    <button type="button" class="coordinator-engine-card" aria-label="${t('切换总控引擎')}" aria-describedby="coordinator-current-engine" aria-haspopup="listbox" aria-expanded="false" data-for="coordinator-engine" data-coordinator-engine="${escape(provider?.id)}">
-      ${provider ? `<span class="coordinator-agent-face" aria-hidden="true">${character(provider)}</span>` : ''}
+    <header class="coordinator-heading">
+      <h2 class="coordinator-section-label">${icon('network')}${t('总控')}</h2>
+      <button type="button" class="icon-button mobile-only" data-coordinator-close aria-label="${t('关闭侧栏')}">${icon('panel-left-close')}</button>
+    </header>
+    ${choices.length ? `<button type="button" class="coordinator-engine-card" aria-label="${t('切换总控引擎')}" aria-describedby="coordinator-current-engine" aria-haspopup="listbox" aria-expanded="false" data-for="coordinator-engine" data-coordinator-engine="${escape(provider?.id)}">
+      <span class="coordinator-agent-face" aria-hidden="true">${provider ? character(provider) : icon('bot')}</span>
       <span class="coordinator-pick">
         <span class="coordinator-selected-name" id="coordinator-current-engine">${escape(provider?.label || t('请选择总控引擎'))}</span>
-        ${view?.sessionId ? `<span class="coordinator-connected">${t('已绑定会话')}</span>` : ''}
+        ${view ? `<span class="coordinator-connection" data-bound="${!!view.sessionId}">${t(view.sessionId ? '已绑定会话' : '未绑定会话')}</span>` : ''}
       </span>
-      ${icon('chevron-down')}
-    </button>
+      <span class="coordinator-engine-chevron" aria-hidden="true">${icon('chevron-down')}</span>
+    </button>` : ''}
   </section>`;
   const status = view?.desktopSetup && !view.pending ? '首次连接桌面'
     : view?.desktopSetup ? '等待桌面初始化' : '正在确认总控会话';
@@ -1262,28 +1270,39 @@ function renderCoordinator() {
     const workerName = worker?.label || task.engine;
     const description = task.purpose ? `${title} · ${task.purpose}` : title;
     const subtitle = [workerName, task.role ? title : null, task.purpose].filter(Boolean).join(' · ');
+    const deliveryState = task.state === 'sent' && !task.nativeTurn ? 'confirming' : task.state;
     const row = `<span class="coordinator-worker-face" aria-hidden="true">${character(worker)}</span>
-      <span class="coordinator-task-target"><strong title="${escape(description)}">${escape(task.role || title)}</strong><small>${escape(subtitle)}</small></span>
-      <span class="coordinator-task-state" data-state="${escape(task.state)}" data-outcome="${escape(task.outcome || '')}"${task.error ? ` title="${escape(say(task.error))}"` : ''}>${t(coordinatorState(task))}</span>`;
+      <span class="coordinator-task-target">
+        <strong title="${escape(description)}">${escape(task.role || title)}</strong>
+        <span class="coordinator-task-meta">
+          <small title="${escape(subtitle)}">${escape(subtitle)}</small>
+          <span class="coordinator-task-state" data-state="${escape(deliveryState)}" data-outcome="${escape(task.outcome || '')}"${task.error ? ` title="${escape(say(task.error))}"` : ''}>${t(coordinatorState(task))}</span>
+        </span>
+      </span>`;
     const href = `#${encodeURIComponent(task.engine)}/${encodeURIComponent(task.target)}`;
-    return `<li>${worker ? `<a class="coordinator-task" href="${escape(href)}" data-coordinator-session>${row}</a>` : `<div class="coordinator-task">${row}</div>`}</li>`;
+    return `<li>${worker ? `<a class="coordinator-task" href="${escape(href)}" data-coordinator-session>${row}<span class="coordinator-task-arrow" aria-hidden="true">${icon('chevron-right')}</span></a>` : `<div class="coordinator-task">${row}</div>`}</li>`;
   }).join('');
   const location = find(pane, '.coordinator-location', HTMLDetailsElement);
   const expanded = location?.open;
+  const scrollTop = find(pane, '.coordinator-workspace', HTMLElement)?.scrollTop || 0;
   const trigger = find(pane, '[data-coordinator-engine]', HTMLButtonElement);
   const triggerFocused = trigger && document.activeElement === trigger;
+  const focusedSession = closest(document.activeElement, '[data-coordinator-session]', HTMLAnchorElement);
   const groupDirectory = `<section data-group-directory><div class="coordinator-session-heading group-directory-heading">
-    <h2>${t('群聊')}</h2><button type="button" data-group-create>${icon('plus')}${t('新建群聊')}</button></div></section>`;
+    <h2 class="coordinator-section-label">${icon('users-round')}${t('群聊')}</h2><button type="button" data-group-create>${icon('plus')}${t('新建群聊')}</button></div></section>`;
   setHTML(pane, choices.length
-    ? `${select}${view ? setup + candidates : ''}${groupDirectory}${view ? `
-      <section><div class="coordinator-session-heading"><h2>${t('协作会话')}</h2>
-        ${view.sessionId ? `<button type="button" data-coordinator-remember>${t('记住会话')}</button>` : ''}</div>
-        ${sessions ? `<ul class="coordinator-tasks">${sessions}</ul>` : `<div class="coordinator-empty">${icon('messages-square')}<p>${t('这里会显示你让总控记住的会话，以及它派过任务的会话。')}</p></div>`}</section>
+    ? `${select}<div class="coordinator-workspace">
+      ${view ? setup + (candidates ? `<div class="coordinator-candidates">${candidates}</div>` : '') : ''}
+      ${groupDirectory}
+      ${view ? `<section><div class="coordinator-session-heading"><h2 class="coordinator-section-label">${icon('messages-square')}${t('协作会话')}</h2>
+        ${view.sessionId ? `<button type="button" data-coordinator-remember>${icon('bookmark-plus')}${t('记住会话')}</button>` : ''}</div>
+        ${sessions ? `<ul class="coordinator-tasks">${sessions}</ul>` : `<p class="coordinator-empty">${t('暂无协作会话')}</p>`}</section>` : ''}
+      </div>${view ? `
       <div class="coordinator-footer">
         <button type="button" class="coordinator-channel" data-coordinator-weixin aria-haspopup="dialog">${icon('messages-square')}<span>${t('微信')}</span>${icon('chevron-right')}</button>
         <details class="coordinator-location"><summary>${icon('folder-open')}<span>${t('工作目录')}</span>${icon('chevron-right')}</summary><p class="coordinator-path">${escape(view.cwd)}</p></details>
       </div>` : ''}`
-    : `<p>${t('没有可用的总控引擎')}</p>`);
+    : `${select}<div class="coordinator-workspace"><p class="coordinator-empty">${t('没有可用的总控引擎')}</p></div>`);
   if (trigger && !trigger.isConnected) {
     const next = find(pane, '[data-coordinator-engine]', HTMLButtonElement);
     if (trigger.getAttribute('aria-expanded') === 'true') {
@@ -1296,6 +1315,11 @@ function renderCoordinator() {
   }
   if (expanded) find(pane, '.coordinator-location', HTMLDetailsElement)?.setAttribute('open', '');
   groups.mount();
+  const workspace = find(pane, '.coordinator-workspace', HTMLElement);
+  if (workspace && workspace.scrollTop !== scrollTop) workspace.scrollTop = scrollTop;
+  if (focusedSession && !focusedSession.isConnected) {
+    findAll(pane, '[data-coordinator-session]', HTMLAnchorElement).find(item => item.hash === focusedSession.hash)?.focus({ preventScroll: true });
+  }
   hydrateIcons(pane);
 }
 async function openCoordinator(preferred?: string, route = true, directoryOnly = false) {

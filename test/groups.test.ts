@@ -28,6 +28,7 @@ function setup(t: TestContext) {
   let groups: Groups;
   let count = 0;
   function install(id: string, controller = false) {
+    const read = (target: string) => { reads.push(id + ':' + target); return must(histories.get(id + ':' + target)); };
     const catalog = (cwd?: string) => {
       catalogs.push(id);
       return [...histories.values()].flatMap(({ session }) => session?.engine === id && (!cwd || session.cwd === cwd)
@@ -35,11 +36,13 @@ function setup(t: TestContext) {
     };
     const engine: Engine = {
       ...required, id, label: id, capabilities: { send: true, createRequiresPrompt: controller },
+      list: () => [...histories.values()].flatMap(({ session }) => session?.engine === id ? [session] : []),
+      read,
       coordinator: {
         root: controller ? path.join(directory, id) : undefined,
         groupMember: controller ? id === 'codex' ? {} : { root: path.join(directory, id) } : { root: path.join(directory, id), catalog },
         catalog,
-        read(target) { reads.push(id + ':' + target); return must(histories.get(id + ':' + target)); },
+        read,
       },
       create(input) {
         created.push({ engine: id, input });
@@ -100,12 +103,22 @@ test('mixed agents can join as fresh or existing members and only a recipient ge
   groups.send(id, { key: 'ask', member: JSON.stringify(['codex', coder?.id]), text: 'Review this' });
   await groups.poll(); await groups.poll();
   const bound = must(groups.view(id).members[0]?.sessionId);
-  assert.notEqual(bound, groups.view(id).sessionId);
+  const hostId = must(groups.view(id).sessionId);
+  assert.notEqual(bound, hostId);
+  assert.equal(fixture.created[0]?.input.title, '「群聊」Review');
+  assert.equal(fixture.created[1]?.input.title, '「Review」Fresh Codex');
   assert.equal(groups.view(id).members[1]?.sessionId, undefined);
   assert.equal(fixture.sent.length, 0, 'the first prompt already went through native creation');
   assert.match(must(fixture.created[1]?.input.prompt), /Review this/);
   assert.equal(groups.view(id).messages.at(-1)?.native?.id, bound);
   groups = await fixture.reopen();
+  const reads = fixture.reads.length;
+  assert.deepEqual(groups.sessionRoles('codex').get(hostId), { kind: 'group-host', group: 'Review' });
+  assert.deepEqual(groups.sessionRoles('codex').get(bound), { kind: 'group-member', group: 'Review', nativeTitlePrefix: '「Review」' });
+  assert.equal(groups.sessionRoles('dsh').has('B'), false);
+  assert.equal(fixture.reads.length, reads, 'loading roles does not read any native conversations');
+  groups.rename(id, { name: 'Revised review' });
+  assert.deepEqual(groups.sessionRoles('codex', bound).get(bound), { kind: 'group-member', group: 'Revised review', nativeTitlePrefix: '「Review」' });
   groups.send(id, { key: 'follow', member: JSON.stringify(['codex', coder?.id]), text: 'Follow up' });
   await groups.poll();
   assert.equal(fixture.sent[0]?.target, 'codex:' + bound);
@@ -907,15 +920,25 @@ test('the HTTP group API serves task progress and cancellation alongside the exi
   assert.equal(members[0].id, 'B');
   assert.deepEqual(fixture.reads, []);
 
-  const host = new UnifiedSession({ id: 'http-host', engine: 'codex', cwd: fixture.directory, status: 'busy' });
+  const host = new UnifiedSession({ id: 'http-host', engine: 'codex', title: 'Native host title', cwd: fixture.directory, status: 'busy' });
   fixture.histories.set('codex:' + host.id, { session: host, turns: [] });
   const post = (route: string, body: object) => fetch(base + route, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
-  const createdResponse = await post('/api/groups/codex/create', { key: 'http-group', name: 'HTTP group', hostSession: host.id });
+  const createdResponse = await post('/api/groups/codex/create', { key: 'http-group', name: 'HTTP group', hostSession: host.id,
+    members: [{ engine: 'dsh', id: 'B' }] });
   assert.equal(createdResponse.status, 202);
   const room: GroupView = await createdResponse.json();
   const route = '/api/groups/' + room.id;
+  const reads = fixture.reads.length;
+  const sessions = await (await fetch(base + '/api/sessions')).json();
+  assert.equal(fixture.reads.length, reads);
+  assert.equal(sessions.codex[0].title, 'Native host title');
+  assert.deepEqual(sessions.codex[0].metadata.frontdeskRole, { kind: 'group-host', group: 'HTTP group' });
+  assert.equal(sessions.dsh.find((item: UnifiedSession) => item.id === 'B').metadata.frontdeskRole, undefined);
+  const hostHistory = await (await fetch(base + '/api/sessions/codex/' + host.id)).json();
+  assert.deepEqual(hostHistory.session.metadata.frontdeskRole, sessions.codex[0].metadata.frontdeskRole);
+  assert.equal(host.metadata.frontdeskRole, undefined, 'the engine record is not decorated in place');
   assert.equal(await (await fetch(base + route + '/task')).json(), null);
   const startedResponse = await post(route + '/messages', { key: 'task', text: 'Review the draft' });
   assert.equal(startedResponse.status, 202);

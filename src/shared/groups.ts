@@ -26,6 +26,8 @@ export interface GroupMember {
   /** A dedicated member keeps its group identity even before a native chat exists. */
   dedicated?: boolean;
   sessionId?: string;
+  /** Prefix requested at creation, which the desktop title may still carry after a group rename. */
+  nativeTitlePrefix?: string;
   setup?: GroupMemberSetup;
   nativeSettings?: { cwd: string; model?: string };
   canEditSetup?: boolean;
