@@ -93,13 +93,13 @@ If you know a way to act on a Chromium/Electron window on Windows without it tak
 
 ### Coordinator
 
-DeepSeek Harness can join the agent rail and receive work from a coordinator through its local desktop plugin. [DSH setup and supported actions](docs/skins/dsh/progress.md)
+DeepSeek Harness can join the agent rail and receive work from a coordinator. Install the local package from `integrations/dsh-frontdesk-bridge` in the DSH desktop profile, enable **Agent Frontdesk bridge** in **Settings → Plugins**, and restart DSH. [DSH setup and supported actions](docs/skins/dsh/progress.md)
 
 Click the robot at the top of the rail to open your last-used coordinator chat. Choose Codex or Antigravity as the coordinator. Each keeps a separate project under `agent-frontdesk/<engine>-controller/` in its data directory. For Codex, open the setup draft, confirm the folder in the desktop app if prompted, and send the draft there once. After Frontdesk verifies the native chat and its folder, you can send tasks in the browser.
 
 The agent icons below open their regular chats. Ask the coordinator to find an existing Codex, Antigravity, or Claude coding chat, check its progress, or send it a message. Delegated tasks are tracked in the sidebar. Frontdesk can follow them with the browser closed while its server is running.
 
-Run `BRIDGE_COORDINATOR_PROFILE=preview PORT=4190 npm start` for a separate preview. Its coordinator projects live under `agent-frontdesk/profiles/preview/` and have their own chat bindings, connections, and tasks.
+To run a separate instance, set `BRIDGE_COORDINATOR_PROFILE` to a name such as `test` and set `PORT` to a free port before starting Frontdesk. Coordinator projects for that profile live under `agent-frontdesk/profiles/<name>/`. Use a different `BRIDGE_SETTINGS_FILE` if the instances should also have separate settings.
 
 Click **Remember chats** and describe a project, topic, or task. The coordinator can save any matching chat with a short description and an optional alias. Delegating work also remembers the target chat. Later you can say “Have the chat that collected the interviews add yesterday’s notes.” The coordinator checks its saved chats and asks you to choose if several fit. Each coordinator keeps its own list across restarts. Its local tool supports `track`, `workers`, and `untrack`. Expand a dispatch receipt to see the instruction, the target’s reply, or a delivery error. Once the desktop confirms delivery, **Open target chat** takes you to that turn. When you ask the coordinator to act on a reply, the tool uses `send` with `followUp: true` to start a follow-up turn. Receipts without a known source turn appear in the dispatch history at the bottom of the conversation.
 
@@ -111,9 +111,11 @@ Use **Manage members** to add existing chats, set up dedicated members, or remov
 
 The host continues in its own desktop chat. Ask it to consider member replies when needed, or use **Reply to this** to include a specific excerpt. Members receive their assigned question and relevant excerpts. If the same native chat participates in two groups, it remembers the tasks it received from both.
 
+Each group advances one host-led task at a time. Open **View task progress** to see deliveries and approvals without sending a desktop message. Choose **Add to current task** to give the host more requirements, or **Replace current task** to start a different task. **Stop further dispatches** keeps the receipts for turns already sent. Follow the desktop link to stop an already running turn. The host looks for replies from the current task by default. Use **Reply to this** to bring a specific message from earlier work.
+
 #### Message the coordinator from WeChat
 
-On the Mac running Frontdesk, open an initialized coordinator chat and choose **WeChat** at the bottom of its sidebar. Generate a QR code, scan it with your own WeChat account, and enter the verification code if WeChat shows one. Private text messages go to the bound desktop chat. Its replies, delegated results, and requests for attention come back to the same WeChat conversation. You can close the browser while Frontdesk and the desktop engines stay running on the Mac.
+On the computer running Frontdesk, open an initialized coordinator chat and choose **WeChat** at the bottom of its sidebar. Generate a QR code, scan it with your own WeChat account, and enter the verification code if WeChat shows one. Private text messages go to the bound desktop chat. Its replies, delegated results, and requests for attention come back to the same WeChat conversation. You can close the browser while Frontdesk and the desktop engines stay running.
 
 Each Frontdesk configuration binds one WeChat direct chat to one coordinator. Switching coordinators in the browser keeps the existing binding. The channel accepts private text from the paired account. Approvals and decisions to implement a plan use the desktop workflow. To stop forwarding, open **WeChat** and choose **Disconnect WeChat**. Credentials and delivery state are stored locally under `~/.config/agent-frontdesk/weixin/`. The connection uses [Tencent iLink](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol.md) long polling.
 
@@ -157,6 +159,7 @@ All optional. Frontdesk finds standard install locations by itself.
 | `BRIDGE_UPLOADS_DIR` | Where attachments are stored | `uploads/` in the project |
 | `BRIDGE_EXPORTS_DIR` | Where the whole record of a long chat you refer to is written as Markdown, when the message carries it shortened (kept 30 days) | `exports/` in the project |
 | `BRIDGE_SETTINGS_FILE` | Where it keeps which AIs are on, their names and order | `.frontdesk.json` in the project |
+| `BRIDGE_COORDINATOR_PROFILE` | Name for an instance's coordinator, group and WeChat bindings | unnamed default profile |
 | `BRIDGE_PLUGIN_DIR` | Folder the plugins are loaded from | `dist/server/plugins` |
 | `BRIDGE_MODEL_CATALOG` | JSON file of model IDs for AIs that cannot list their own | none |
 | `BRIDGE_DICTATION_ENGINE` | Which AI's speech-to-text voice input tries first; it falls back to another AI's or the browser's | `claude` |
@@ -164,6 +167,10 @@ All optional. Frontdesk finds standard install locations by itself.
 | `CLAUDE_BIN` / `CLAUDE_HOME` | Claude Code executable and session folder | found on `PATH` or in Claude's app data / `~/.claude` |
 | `CLAUDE_DESKTOP_HOME` | Claude desktop app's data folder | `~/Library/Application Support/Claude` (Windows: `%LOCALAPPDATA%\Claude-Data\claude_<id>`, else `%APPDATA%\Claude`) |
 | `AGENTAPI_BIN` / `ANTIGRAVITY_HOME` | Antigravity's CLI and data folder | `~/.gemini/antigravity` |
+| `DSH_HOME` | DeepSeek Harness data folder, set in both desktop and Frontdesk when using a custom folder | `~/.dsh` |
+| `DSH_FRONTDESK_BRIDGE_FILE` | Shared DSH bridge connection file, set to the same path in both processes | `frontdesk-bridge.json` in the DSH data folder |
+| `DSH_APP_ASAR` / `DSH_APP_ICON` | Installed DeepSeek Harness app archive and icon for a nonstandard install | macOS app bundle |
+| `WORKBUDDY_HOME` | WorkBuddy session data folder | `~/.workbuddy` |
 | `CHATGPT_APP_ASAR` / `CLAUDE_APP_ASAR` / `ANTIGRAVITY_APP_ICON` | Installed apps that icons, characters and fonts are read from | `/Applications` on macOS, `%LOCALAPPDATA%\Programs` or MSIX on Windows |
 
 </details>

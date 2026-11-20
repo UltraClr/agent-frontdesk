@@ -8,6 +8,32 @@ import { pathToFileURL } from 'node:url';
 import { DshBridge } from '../src/server/dsh-bridge.js';
 import { get } from '../src/shared/guards.js';
 
+test('DSH companion and Frontdesk find each other under a custom DSH home', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'frontdesk-dsh-home-'));
+  const userHome = path.join(dir, 'user-home'), dshHome = path.join(dir, 'dsh-home');
+  const stateFile = path.join(dshHome, 'frontdesk-bridge.json');
+  const companion = await import(pathToFileURL(path.resolve('integrations/dsh-frontdesk-bridge/index.js')).href);
+  const variables = ['HOME', 'USERPROFILE', 'DSH_HOME', 'DSH_FRONTDESK_BRIDGE_FILE'] as const;
+  const previous = variables.map(key => [key, process.env[key]] as const);
+  let teardown: (() => Promise<void>) | undefined;
+  const bridge = new DshBridge({ home: dshHome });
+  t.after(async () => { bridge.dispose(); await teardown?.(); fs.rmSync(dir, { recursive: true, force: true }); });
+  try {
+    process.env.HOME = userHome;
+    process.env.USERPROFILE = userHome;
+    process.env.DSH_HOME = dshHome;
+    delete process.env.DSH_FRONTDESK_BRIDGE_FILE;
+    teardown = companion.apply({});
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  for (let i = 0; !fs.existsSync(stateFile) && i < 50; i++) await delay(10);
+  assert.equal((await bridge.status()).connected, true);
+  assert.equal(fs.existsSync(path.join(userHome, '.dsh', 'frontdesk-bridge.json')), false);
+});
+
 test('DSH uses the installed desktop bridge, searches without reading turns and tracks native outcomes', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'frontdesk-dsh-test-'));
   const stateFile = path.join(dir, 'bridge.json');

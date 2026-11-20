@@ -66,6 +66,8 @@ export interface GroupMessage {
   replaces?: string;
   sources?: string[];
   decision?: boolean;
+  taskId?: string;
+  taskRevision?: number;
 }
 
 export interface GroupDelivery {
@@ -79,13 +81,25 @@ export interface GroupDelivery {
   nativeTurn: string | null;
   dispatched: number | null;
   note: string;
+  taskId?: string;
+  taskRevision?: number;
+  outcome?: 'completed' | 'failed' | 'interrupted' | 'cancelled';
   memberId?: string;
   creatingMember?: boolean;
   removedMember?: string;
   attention?: Pick<Approval, 'id' | 'title' | 'kind'>;
 }
 
+export interface GroupTask {
+  id: string;
+  revision: number;
+  state: 'queued' | 'confirming' | 'running' | 'waiting' | 'blocked' | 'paused' | 'completed' | 'cancelled' | 'failed';
+  request: string;
+  deliveries: GroupDelivery[];
+}
+
 export interface GroupView extends GroupSummary {
+  task: GroupTask | null;
   messages: GroupMessage[];
   deliveries: GroupDelivery[];
   before: number | null;

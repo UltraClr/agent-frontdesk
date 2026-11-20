@@ -350,6 +350,8 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
   app.get('/api/group-members/:engine', async (req, res) => res.json(await groups.members(req.params.engine, String(req.query.q || ''))));
   app.post('/api/groups/:engine/create', async (req, res) => res.status(202).json(await groups.create(engineOf(req), req.body)));
   app.get('/api/groups/:group', (req, res) => res.json(groups.view(req.params.group, Number(req.query.before) || undefined)));
+  app.get('/api/groups/:group/task', (req, res) => res.json(groups.progress(req.params.group)));
+  app.post('/api/groups/:group/task/cancel', (req, res) => res.json(groups.cancel(req.params.group, req.body)));
   app.get('/api/groups/:group/decisions', (req, res) => res.json(groups.decisions(req.params.group, Number(req.query.before) || undefined)));
   app.post('/api/groups/:group/prepare', async (req, res) => res.json(await groups.prepare(req.params.group)));
   app.post('/api/groups/:group/retry', (req, res) => res.json(groups.retry(req.params.group)));

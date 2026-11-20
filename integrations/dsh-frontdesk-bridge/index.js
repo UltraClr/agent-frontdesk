@@ -24,7 +24,8 @@ function permitted(route, namespace, method, args) {
 }
 
 export function apply(ctx, config = {}) {
-  const file = config.stateFile || process.env.DSH_FRONTDESK_BRIDGE_FILE || join(homedir(), '.dsh', 'frontdesk-bridge.json');
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh');
+  const file = config.stateFile || process.env.DSH_FRONTDESK_BRIDGE_FILE || join(home, 'frontdesk-bridge.json');
   const secret = randomBytes(32).toString('hex'), expected = Buffer.from(secret);
   const streams = new Set();
   let peer;

@@ -93,13 +93,13 @@ Claude 的模型列表、额度和语音输入还要登录一次 Claude Code，�
 
 ### 总控
 
-DeepSeek Harness 可以加入侧栏，由总控按需查找会话、读取进展或代发消息。请在 DSH 桌面配置中启用本地桥插件。[DSH 接入说明](docs/skins/dsh/progress.md)
+DeepSeek Harness 可以加入侧栏，由总控按需查找会话、读取进展或代发消息。在 DSH 桌面配置中安装 `integrations/dsh-frontdesk-bridge` 下的本地包，在「设置 → 插件」中启用「Agent Frontdesk bridge」，然后重启 DSH。[DSH 接入说明](docs/skins/dsh/progress.md)
 
 点 Agent 栏左上角的机器人图标，进入最近使用的总控会话。可以选择 Codex 或 Antigravity 担任总控，各自的项目都位于数据根目录的 `agent-frontdesk/<引擎>-controller/` 下。Codex 首次使用时，点「打开桌面初始化草稿」，在桌面确认目录并发送草稿。工作台会核对原生会话与目录，以后可以直接在网页派发任务。
 
 下面的 Agent 图标打开各自的普通会话。你可以对总控说「找整理访谈的会话，问它记录齐了没有，等它回复后告诉写周报的会话」。总控按需检索 Codex、Antigravity 和 Claude 的编码会话，目标不明确时会请你选择。侧栏显示派发与回传进度。关闭网页后，正在运行的 Frontdesk 仍会跟进，桌面审批在目标会话中处理。
 
-使用 `BRIDGE_COORDINATOR_PROFILE=preview PORT=4190 npm start` 可开启独立验收实例。其总控目录位于 `agent-frontdesk/profiles/preview/`，会话绑定、连接和待办与默认实例独立。
+要并行运行独立实例，启动前将 `BRIDGE_COORDINATOR_PROFILE` 设为自选名称（例如 `test`），并通过 `PORT` 选择空闲端口。该实例的总控目录位于 `agent-frontdesk/profiles/<名称>/`。若也要隔离设置，为各实例指定不同的 `BRIDGE_SETTINGS_FILE`。
 
 在侧栏点「记住会话」，告诉总控你关心的项目、话题或任务。总控可以按会话正在做的事留一句说明，也可以使用你给的别名。派过任务的会话会自动记住。以后直接说「让整理访谈的那个会话补上昨天的记录」，总控会找回原会话。有多个匹配时会先让你选。每个总控的列表单独保存，重启后仍可使用。本地工具用 `track` 记住会话、`workers` 查看列表、`untrack` 取消登记。展开派发记录可查看原指令、目标的回复或投递错误。目标桌面确认收到后，点「打开目标会话」可定位到那一轮。你要求收到回复后继续处理时，工具通过 `send` 的 `followUp: true` 唤起总控接着做。无法关联到原回复的记录可在总控对话底部查看。
 
@@ -111,9 +111,11 @@ DeepSeek Harness 可以加入侧栏，由总控按需查找会话、读取进展
 
 群主沿用自己的桌面会话。需要汇总成员意见时，可以直接请群主查看成员回复，也可以用「回复这条」带上一条指定摘录。成员收到各自的问题和相关摘录。同一个原生会话加入两个群时，会保留它在两个群收到的任务。
 
+每个群同时推进一项群主主持的任务。打开「查看任务进度」可以看回执和等待中的审批，无需向桌面发消息。新增要求时选「补充当前任务」，改目标时选「替换当前任务」。「停止后续派发」保留已发送轮次的回执。需要停止正在执行的轮次时，可打开它的原会话。群主默认读取当前任务的成员回复，需要带上以前的发言时使用「回复这条」。
+
 #### 用微信给总控发消息
 
-在运行 Frontdesk 的 Mac 上打开一个已经初始化的总控，点侧栏底部的「微信」，生成二维码后用自己的微信扫码确认。如果微信显示数字验证码，在弹窗内填入。微信私聊里的文字会送入绑定的桌面会话。总控回复、对应协作结果和等待操作提醒会回到该私聊。可以关闭网页，Mac 上的 Frontdesk 服务和相关桌面引擎继续运行即可。
+在运行 Frontdesk 的电脑上打开一个已经初始化的总控，点侧栏底部的「微信」，生成二维码后用自己的微信扫码确认。如果微信显示数字验证码，在弹窗内填入。微信私聊里的文字会送入绑定的桌面会话。总控回复、对应协作结果和等待操作提醒会回到该私聊。可以关闭网页，保持 Frontdesk 服务和相关桌面引擎运行即可。
 
 每个 Frontdesk 实例配置绑定一个微信私聊和一个总控会话。切换网页里的总控不会改变微信的绑定。入口仅接收扫码账号的私聊文本，审批和执行计划仍通过桌面流程处理。可在「微信」弹窗断开，凭证和待回传状态保存在本机 `~/.config/agent-frontdesk/weixin/` 下。连接使用 [腾讯 iLink](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol_zh_CN.md) 长轮询。
 
@@ -157,6 +159,7 @@ Frontdesk 是跑在你电脑上的一个小服务。它读各家桌面应用留�
 | `BRIDGE_UPLOADS_DIR` | 附件存放位置 | 项目里的 `uploads/` |
 | `BRIDGE_EXPORTS_DIR` | 引用的聊天太长、消息里做了精简时，完整记录写成 Markdown 的存放位置（保留 30 天） | 项目里的 `exports/` |
 | `BRIDGE_SETTINGS_FILE` | 哪些 AI 开着、它们的名字和顺序存在哪 | 项目里的 `.frontdesk.json` |
+| `BRIDGE_COORDINATOR_PROFILE` | 区分不同实例的总控、群聊和微信绑定 | 无名称的默认配置 |
 | `BRIDGE_PLUGIN_DIR` | 从哪个目录加载插件 | `dist/server/plugins` |
 | `BRIDGE_MODEL_CATALOG` | 给列不出自己模型的 AI 用的模型 ID JSON 文件 | 无 |
 | `BRIDGE_DICTATION_ENGINE` | 语音输入先试哪个 AI 的识别，用不了时换其他 AI 的或浏览器的 | `claude` |
@@ -164,6 +167,10 @@ Frontdesk 是跑在你电脑上的一个小服务。它读各家桌面应用留�
 | `CLAUDE_BIN` / `CLAUDE_HOME` | Claude Code 可执行文件和会话目录 | 从 `PATH` 或 Claude 的应用数据里找 / `~/.claude` |
 | `CLAUDE_DESKTOP_HOME` | Claude 桌面应用的数据目录 | `~/Library/Application Support/Claude`（Windows 为 `%LOCALAPPDATA%\Claude-Data\claude_<id>`，没有时为 `%APPDATA%\Claude`） |
 | `AGENTAPI_BIN` / `ANTIGRAVITY_HOME` | Antigravity 的命令行工具和数据目录 | `~/.gemini/antigravity` |
+| `DSH_HOME` | DeepSeek Harness 数据目录。使用自定义目录时，在 DSH 桌面端和 Frontdesk 中都要设置 | `~/.dsh` |
+| `DSH_FRONTDESK_BRIDGE_FILE` | DSH 桥接连接文件，两个进程使用同一路径 | DSH 数据目录下的 `frontdesk-bridge.json` |
+| `DSH_APP_ASAR` / `DSH_APP_ICON` | 非标准安装位置的 DeepSeek Harness 应用归档和图标 | macOS 的应用包 |
+| `WORKBUDDY_HOME` | WorkBuddy 会话数据目录 | `~/.workbuddy` |
 | `CHATGPT_APP_ASAR` / `CLAUDE_APP_ASAR` / `ANTIGRAVITY_APP_ICON` | 从这些已安装的应用里读图标、角色和字体 | macOS 在 `/Applications` 下，Windows 在 `%LOCALAPPDATA%\Programs` 或 MSIX 下 |
 
 </details>

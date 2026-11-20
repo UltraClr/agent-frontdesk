@@ -1,4 +1,4 @@
-import type { GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupSummary, GroupView } from '../../shared/groups.js';
+import type { GroupDelivery, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupSummary, GroupView } from '../../shared/groups.js';
 import { messageOf } from '../../shared/guards.js';
 import { request } from './api.js';
 import { say, t } from './i18n.js';
@@ -6,7 +6,14 @@ import { character, escape, hydrateIcons, icon, markdown } from './renderers.js'
 
 type Page = { items: GroupSummary[]; nextOffset: number | null };
 type Agent = { id: string; label: string };
-type Draft = { text: string; member: string; replyTo: string; key?: string };
+type TaskAction = 'start' | 'supplement' | 'replace';
+type Draft = { text: string; member: string; replyTo: string; key?: string; taskAction?: TaskAction; taskId?: string; taskRevision?: number };
+const activeTaskStates = new Set(['queued', 'confirming', 'running', 'waiting', 'blocked', 'paused']);
+const taskLabels = {
+  queued: '等待投递', confirming: '正在确认桌面记录', running: '正在推进', waiting: '等待用户操作', blocked: '群任务受阻',
+  paused: '群任务已暂停', completed: '群任务已完成', cancelled: '已停止后续派发', failed: '群任务未完成',
+} as const;
+const receiptOutcomes = { completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止', cancelled: '已撤销待投递消息' } as const;
 type HostChoice = { engine: string; hostSession?: string };
 const enc = encodeURIComponent;
 const api = '/api/groups';
@@ -166,6 +173,8 @@ export class GroupPanel {
   private loading = false;
   private loadingRoom = false;
   private sending = false;
+  private roomGeneration = 0;
+  private writingRoom = '';
   private target = '';
   private directoryMarkup = '';
   private older: GroupMessage[] = [];
@@ -176,10 +185,13 @@ export class GroupPanel {
   private readonly topic: HTMLElement;
   private readonly members: HTMLElement;
   private readonly status: HTMLElement;
+  private readonly taskPanel: HTMLElement;
+  private taskMarkup = '';
   private readonly timeline: HTMLElement;
   private readonly form: HTMLFormElement;
   private readonly input: HTMLTextAreaElement;
   private readonly receiver: HTMLSelectElement;
+  private readonly taskAction: HTMLSelectElement;
   private readonly dialog: HTMLDialogElement;
 
   constructor(readonly panel: HTMLElement, private sidebar: HTMLElement, private currentEngine: () => string,
@@ -193,10 +205,12 @@ export class GroupPanel {
         <div class="group-tools"><button type="button" data-group-manage>${t('管理成员')}</button><button type="button" data-group-rename>${t('重命名')}</button><button type="button" data-group-pin></button><button type="button" data-group-pause></button></div>
       </header>
       <div class="group-members"></div><div class="group-status" role="status"></div>
+      <div class="group-task-panel" hidden></div>
       <section class="group-messages" aria-label="${t('群聊')}" tabindex="0"></section>
       <form class="group-composer">
         <div class="group-quote" hidden></div>
         <label>${icon('at-sign')}<span>${t('发送给')}</span><select aria-label="${t('收件人')}"></select></label>
+        <label data-group-task-action hidden><span>${t('任务操作')}</span><select aria-label="${t('任务操作')}"></select></label>
         <textarea required maxlength="12000" aria-label="${t('发送群消息')}" placeholder="${t('发送群消息')}"></textarea>
         <button class="primary-button" type="submit">${t('发送')}</button>
       </form>
@@ -205,10 +219,12 @@ export class GroupPanel {
     this.topic = panel.querySelector('.group-topic')!;
     this.members = panel.querySelector('.group-members')!;
     this.status = panel.querySelector('.group-status')!;
+    this.taskPanel = panel.querySelector('.group-task-panel')!;
     this.timeline = panel.querySelector('.group-messages')!;
     this.form = panel.querySelector('form')!;
     this.input = panel.querySelector('textarea')!;
     this.receiver = panel.querySelector('select')!;
+    this.taskAction = panel.querySelector('[data-group-task-action] select')!;
     this.dialog = panel.querySelector('dialog')!;
     document.body.append(this.dialog);
     this.list = document.createElement('div');
@@ -230,7 +246,16 @@ export class GroupPanel {
     });
     panel.addEventListener('click', event => void this.action(event));
     this.input.addEventListener('input', () => { this.draft.key = undefined; this.save(); });
-    this.receiver.addEventListener('change', () => { this.draft.key = undefined; this.save(); });
+    this.receiver.addEventListener('change', () => this.changeRecipient());
+    this.taskAction.addEventListener('change', () => {
+      const action = this.taskAction.value as TaskAction | '';
+      const task = this.room?.task;
+      this.draft.taskAction = action || undefined;
+      this.draft.taskId = action && action !== 'start' ? task?.id : undefined;
+      this.draft.taskRevision = action && action !== 'start' ? task?.revision : undefined;
+      this.draft.key = undefined;
+      this.save();
+    });
     this.form.addEventListener('submit', event => { event.preventDefault(); void this.send(); });
     hydrateIcons(panel);
     setInterval(() => {
@@ -291,6 +316,7 @@ export class GroupPanel {
       setLocal('frontdesk:group:anchor:' + this.id, visible?.dataset['messageId'] || '');
     }
     this.id = '';
+    this.roomGeneration++;
     this.room = undefined;
     this.panel.hidden = true;
     this.panel.parentElement?.removeAttribute('data-group');
@@ -311,6 +337,9 @@ export class GroupPanel {
       this.title.textContent = t('群聊');
       this.topic.textContent = '';
       this.members.replaceChildren();
+      this.taskPanel.replaceChildren();
+      this.taskPanel.hidden = true;
+      this.taskMarkup = '';
       this.status.textContent = t('正在读取群聊');
       this.form.hidden = true;
       try { this.draft = JSON.parse(getLocal('frontdesk:group:draft:' + id) || '{"text":"","member":"","replyTo":""}'); }
@@ -324,24 +353,26 @@ export class GroupPanel {
 
   private async refresh() {
     const id = this.id;
-    if (!id || (this.loadingRoom && this.room)) return;
+    if (!id || this.writingRoom === id || (this.loadingRoom && this.room)) return;
+    const generation = this.roomGeneration;
+    const current = () => this.id === id && this.roomGeneration === generation;
     this.loadingRoom = true;
     try {
       const room = await request<GroupView>(url(id));
-      if (this.id !== id) return;
+      if (!current()) return;
       if (this.target && !room.messages.some(message => message.id === this.target)) {
         let before = room.before;
         const accumulated: GroupMessage[] = [];
         while (before && !accumulated.some(message => message.id === this.target)) {
           const page = await request<GroupView>(url(id) + '?before=' + before);
-          if (this.id !== id) return;
+          if (!current()) return;
           accumulated.unshift(...page.messages); before = page.before;
         }
         this.older = accumulated;
         this.before = before;
       }
       if (!this.room || this.target || JSON.stringify(this.room) !== JSON.stringify(room)) this.render(room);
-    } catch (err) { if (this.id === id) this.status.textContent = messageOf(err); }
+    } catch (err) { if (current()) this.status.textContent = messageOf(err); }
     finally { this.loadingRoom = false; }
   }
 
@@ -395,16 +426,11 @@ export class GroupPanel {
     const messages = [...this.older, ...room.messages];
     const distinct = new Map(messages.map(message => [message.id, message]));
     const rows = [...distinct.values()].map(message => this.renderMessage(message, distinct)).join('');
-    const waiting = room.deliveries.map(item => {
-      const label = item.kind === 'host' ? t('群主') : item.removedMember || room.members.find(member => member.engine === item.engine && member.id === (item.memberId || item.target))?.alias || this.label(item.engine);
-      const state = item.state === 'blocked' ? '未投递' : item.creatingMember ? item.state === 'queued' ? '等待新建成员会话' : '正在确认新会话'
-        : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
-      const target = item.creatingMember ? escape(label) : `<a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${escape(label)}</a>`;
-      const retry = item.state === 'blocked' && !room.paused ? `<button type="button" data-group-delivery-retry="${escape(item.id)}">${t('重试投递')}</button>` : '';
-      return `<div class="group-delivery">${icon('clock-3')}<span>${target}${item.removedMember ? ' · ' + t('已移出群聊') : ''} · ${t(state)}${item.attention ? ` · ${escape(say(item.attention.title))} · <a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${t('打开原会话处理')}</a>` : ''}${item.note ? ' · ' + escape(say(item.note)) : ''}</span>${retry}</div>`;
-    }).join('');
+    const waiting = room.deliveries.filter(item => !room.task || item.taskId !== room.task.id).map(item => this.renderDelivery(room, item)).join('');
     const empty = !rows && !waiting && room.state === 'ready' ? `<div class="group-empty">${icon('messages-square')}<h2>${t('开始讨论')}</h2><p>${t('可以请群主组织讨论，也可以直接给某个成员发消息。')}</p></div>` : '';
     this.timeline.innerHTML = (before ? `<button data-group-older type="button">${t('查看更早发言')}</button>` : '') + rows + waiting + empty;
+    this.renderTask(room);
+    this.updateTaskAction();
     this.updateQuote();
     hydrateIcons(this.panel);
     const anchor = this.target && this.timeline.querySelector(`[data-message-id="${CSS.escape(this.target)}"]`);
@@ -415,13 +441,67 @@ export class GroupPanel {
     this.drawDirectory();
   }
 
+  private renderDelivery(room: GroupView, item: GroupDelivery, showRevision = false) {
+    const label = item.kind === 'host' ? t('群主') : item.removedMember || room.members.find(member => member.engine === item.engine && member.id === (item.memberId || item.target))?.alias || this.label(item.engine);
+    const state = item.outcome ? receiptOutcomes[item.outcome] : item.state === 'done' ? '投递记录已结束'
+      : item.state === 'blocked' ? '未投递' : item.creatingMember ? item.state === 'queued' ? '等待新建成员会话' : '正在确认新会话'
+        : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
+    const target = item.creatingMember || !item.target ? escape(label) : `<a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${escape(label)}</a>`;
+    const retry = item.state === 'blocked' && !room.paused ? `<button type="button" data-group-delivery-retry="${escape(item.id)}">${t('重试投递')}</button>` : '';
+    const revision = showRevision && item.taskRevision !== undefined ? ` · ${t('第 {n} 版', { n: item.taskRevision })}` : '';
+    return `<div class="group-delivery">${icon('clock-3')}<span>${target}${item.removedMember ? ' · ' + t('已移出群聊') : ''}${revision} · ${t(state)}${item.attention ? ` · ${escape(say(item.attention.title))} · <a data-group-link href="${escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined))}">${t('打开原会话处理')}</a>` : ''}${item.note ? ' · ' + escape(say(item.note)) : ''}</span>${retry}</div>`;
+  }
+
+  private renderTask(room: GroupView) {
+    const task = room.task;
+    this.taskPanel.hidden = !task;
+    const markup = task ? `<details><summary><strong>${t('查看任务进度')}</strong><span>${t(taskLabels[task.state])}</span></summary>
+      <div class="group-task-body"><p>${escape(task.request)}</p>
+      ${task.deliveries.map(item => this.renderDelivery(room, item, true)).join('')}
+      ${activeTaskStates.has(task.state) ? `<button type="button" data-group-task-cancel>${t('停止后续派发')}</button>` : ''}
+      </div></details>` : '';
+    if (this.taskMarkup === markup) return;
+    const open = this.taskPanel.querySelector('details')?.open || false;
+    this.taskMarkup = markup;
+    this.taskPanel.innerHTML = markup;
+    if (open && task) this.taskPanel.querySelector('details')!.open = true;
+  }
+
+  private updateTaskAction() {
+    const task = this.room?.task;
+    const active = !!task && activeTaskStates.has(task.state);
+    const action = this.draft.taskAction;
+    const failed = task?.state === 'failed';
+    const shown = !this.receiver.value && (active || failed || !!action);
+    this.taskAction.closest('label')!.hidden = !shown;
+    if (!shown) return;
+    const options = [new Option(t('选择任务操作'), '')];
+    if (!active) options.push(new Option(t('开始新任务'), 'start'));
+    if (active || failed) options.push(new Option(t('补充当前任务'), 'supplement'));
+    if (active) options.push(new Option(t('替换当前任务'), 'replace'));
+    const matches = this.draft.taskId === task?.id && this.draft.taskRevision === task?.revision;
+    if (Array.from(this.taskAction.options).map(item => item.value).join(',') !== options.map(item => item.value).join(',')) {
+      this.taskAction.replaceChildren(...options);
+    }
+    this.taskAction.value = action && (action === 'start' || matches) && options.some(item => item.value === action) ? action : '';
+  }
+
+  private changeRecipient() {
+    this.draft.key = undefined;
+    this.draft.taskAction = undefined;
+    this.draft.taskId = undefined;
+    this.draft.taskRevision = undefined;
+    this.save();
+    this.updateTaskAction();
+  }
+
   private renderMessage(message: GroupMessage, messages: Map<string, GroupMessage>) {
     const reply = message.replyTo && messages.get(message.replyTo);
     const author = message.kind === 'user' ? t('你') + ' → ' + (message.author || t('群主'))
       : message.kind === 'host' ? t('群主') : message.author;
     const sources = (message.sources || []).map((id, index) => `<a data-group-link href="#group/${enc(this.id)}/${enc(id)}">${t('依据')} ${index + 1}</a>`).join('');
     return `<article class="group-message" data-kind="${message.kind}" data-message-id="${escape(message.id)}">
-      <header><strong>${escape(author || t('群聊'))}</strong>${message.decision ? `<span>${t('结论')}</span>` : ''}</header>
+      <header><strong>${escape(author || t('群聊'))}</strong>${message.taskRevision && message.taskRevision > 1 ? `<span>${t('第 {n} 版', { n: message.taskRevision })}</span>` : ''}${message.decision ? `<span>${t('结论')}</span>` : ''}</header>
       ${reply ? `<blockquote>${escape(reply.text.slice(0, 150))}</blockquote>` : ''}
       <div class="markdown">${markdown(message.kind === 'notice' || !message.native && message.kind === 'member' ? say(message.text) : message.text)}</div>
       <footer>${sources}${message.replaces ? `<a data-group-link href="#group/${enc(this.id)}/${enc(message.replaces)}">${t('查看被取代的结论')}</a>` : ''}
@@ -449,14 +529,21 @@ export class GroupPanel {
   }
 
   private async send() {
-    if (!this.id || this.sending || !this.input.value.trim()) return;
+    if (!this.id || this.sending || this.writingRoom || !this.input.value.trim()) return;
     if (this.receiver.selectedIndex === -1) {
       this.status.textContent = t('请选择收件人后再发送');
       this.receiver.focus();
       return;
     }
+    if (!this.taskAction.closest('label')!.hidden && !this.taskAction.value) {
+      this.status.textContent = t('可直接查看任务进度，或选择任务操作后发送');
+      this.taskAction.focus();
+      return;
+    }
     const id = this.id;
+    const generation = ++this.roomGeneration;
     this.sending = true;
+    this.writingRoom = id;
     const submit = this.form.querySelector<HTMLButtonElement>('button[type=submit]')!;
     submit.disabled = true;
     this.draft.key ||= crypto.randomUUID();
@@ -467,10 +554,11 @@ export class GroupPanel {
         setLocal('frontdesk:group:draft:' + id, JSON.stringify({ text: '', member: '', replyTo: '' }));
         return;
       }
+      if (generation !== this.roomGeneration) return;
       this.draft = { text: '', member: this.receiver.value, replyTo: '' }; this.input.value = ''; this.save();
       this.render(updated);
-    } catch (err) { if (this.id === id) this.status.textContent = messageOf(err); }
-    finally { this.sending = false; submit.disabled = false; }
+    } catch (err) { if (this.id === id && generation === this.roomGeneration) this.status.textContent = messageOf(err); }
+    finally { this.sending = false; this.writingRoom = ''; submit.disabled = false; }
   }
 
   private async action(event: MouseEvent) {
@@ -495,7 +583,7 @@ export class GroupPanel {
       if (button.dataset['groupRecipient']) {
         if (this.form.hidden) return;
         this.receiver.value = button.dataset['groupRecipient'];
-        this.draft.key = undefined; this.save(); this.input.focus(); return;
+        this.changeRecipient(); this.input.focus(); return;
       }
       if (button.dataset['groupQuote']) {
         this.draft.replyTo = button.dataset['groupQuote']; this.draft.key = undefined;
@@ -522,6 +610,15 @@ export class GroupPanel {
         if (this.id === room.id) this.render(updated);
       } else if (button.hasAttribute('data-group-pause')) {
         this.render(await request<GroupView>(base + '/pause', post({ paused: !room.paused }, 'PUT')));
+      } else if (button.hasAttribute('data-group-task-cancel')) {
+        const task = room.task;
+        if (!task || this.writingRoom || !window.confirm(t('停止后续派发？已发出的桌面轮次会继续执行。'))) return;
+        const generation = ++this.roomGeneration;
+        this.writingRoom = room.id;
+        try {
+          const updated = await request<GroupView>(base + '/task/cancel', post({ taskId: task.id, taskRevision: task.revision }));
+          if (this.id === room.id && generation === this.roomGeneration) this.render(updated);
+        } finally { this.writingRoom = ''; }
       } else if (button.hasAttribute('data-group-prepare')) {
         this.render(await request<GroupView>(base + '/prepare', { method: 'POST' }));
       } else if (button.hasAttribute('data-group-retry')) {

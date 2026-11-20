@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { CreateInput, Engine, History } from '../src/shared/contract.js';
+import type { GroupTask, GroupView } from '../src/shared/groups.js';
 import { loadConfig } from '../src/server/config.js';
 import { EventHub } from '../src/server/core/event-hub.js';
 import { PluginHost } from '../src/server/core/plugin-host.js';
@@ -19,7 +20,8 @@ const turn = (id: string, prompt: string, reply: string) => new UnifiedTurn({
 
 function setup(t: TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'frontdesk-groups-'));
-  const file = path.join(directory, 'groups.sqlite'), host = new PluginHost(), runs = new RunService(host, new EventHub());
+  const file = path.join(directory, 'groups.sqlite'), host = new PluginHost();
+  let runs = new RunService(host, new EventHub());
   const histories = new Map<string, History>(), reads: string[] = [], catalogs: string[] = [];
   const sent: Array<{ target: string; prompt: string; emitter: EngineEvents }> = [];
   const reports: string[] = [], created: Array<{ engine: string; input: CreateInput }> = [];
@@ -63,8 +65,12 @@ function setup(t: TestContext) {
   const create = (engine: Engine, key: string) => groups.create(engine, {
     name: 'Experiment', topic: 'ablation', key, members: ['A', 'B', 'C'].map(id => ({ engine: dsh.id, id, alias: id })),
   });
-  const reopen = async () => {
+  const reopen = async (restartRuntime = false) => {
     await groups?.dispose();
+    if (restartRuntime) {
+      runs.dispose();
+      runs = new RunService(host, new EventHub());
+    }
     return groups = new Groups(file, '', host, runs, async (engine, input) => engine.create(input), (binding, id) => reports.push(String(binding.origin) + id));
   };
   const finish = (index: number, reply: string) => {
@@ -73,7 +79,7 @@ function setup(t: TestContext) {
     message.emitter.emit('completed', {});
   };
   t.after(async () => { await groups?.dispose(); runs.dispose(); fs.rmSync(directory, { recursive: true, force: true }); });
-  return { get groups() { return groups; }, create, reopen, codex, agy, dsh, directory, host, runs, histories, reads, catalogs, sent, reports, created, finish };
+  return { get groups() { return groups; }, get runs() { return runs; }, create, reopen, codex, agy, dsh, directory, host, histories, reads, catalogs, sent, reports, created, finish };
 }
 
 test('mixed agents can join as fresh or existing members and only a recipient gets a native chat', async t => {
@@ -273,6 +279,228 @@ test('removing a member withdraws unsent work and preserves the original approva
 });
 
 const groupAction = (value: object) => '\x60\x60\x60frontdesk\n' + JSON.stringify(value) + '\n\x60\x60\x60';
+
+test('reading task progress leaves the original flow intact through an approval and restart', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'read-only-progress');
+  const poll = async () => { await groups.poll(); await groups.poll(); };
+  await poll();
+  const host = 'codex:' + groups.view(id).sessionId;
+
+  groups.send(id, { key: 'task', text: 'Ask B to check the dataset and summarize' });
+  const original = must(groups.progress(id));
+  await poll();
+  assert.equal(groups.progress(id)?.state, 'confirming', 'sending alone does not prove a native turn started');
+  const hostHistory = must(fixture.histories.get(host)).turns;
+  hostHistory.push(new UnifiedTurn({ id: 'turn0', userPrompt: must(fixture.sent[0]).prompt, status: 'running' }));
+  await poll();
+  assert.equal(groups.progress(id)?.state, 'running');
+  hostHistory.pop();
+  fixture.finish(0, groupAction({ action: 'ask', member: 'B', text: 'Check dataset' }));
+  await poll();
+  const memberHistory = must(fixture.histories.get('dsh:B')).turns;
+  memberHistory.push(new UnifiedTurn({ id: 'turn1', userPrompt: must(fixture.sent[1]).prompt, status: 'running',
+    approvals: [{ id: 'check-files', title: 'Approve access', detail: '', kind: 'plan', decisions: ['desktop'] }] }));
+  await poll();
+
+  fixture.reads.length = fixture.catalogs.length = 0;
+  const progress = must(groups.progress(id));
+  assert.equal(progress.id, original.id);
+  assert.equal(progress.revision, original.revision);
+  const memberWork = must(progress.deliveries.find(delivery => delivery.target === 'B'));
+  assert.equal(memberWork.state, 'waiting');
+  assert.equal(memberWork.nativeTurn, 'turn1');
+  assert.equal(memberWork.attention?.id, 'check-files');
+  assert.deepEqual(groups.progress(id), progress);
+  assert.deepEqual(fixture.reads, [], 'viewing progress must not read or wake a native session');
+  assert.deepEqual(fixture.catalogs, []);
+  assert.throws(() => groups.send(id, { key: 'ordinary', text: 'What is the status?' }), { status: 409 });
+  assert.equal(groups.progress(id)?.id, original.id);
+
+  groups = await fixture.reopen(true);
+  await poll();
+  assert.equal(groups.progress(id)?.id, original.id);
+  assert.equal(groups.progress(id)?.deliveries.find(delivery => delivery.target === 'B')?.attention?.id, 'check-files');
+  assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:B']);
+  memberHistory.pop();
+  fixture.finish(1, 'Checked dataset');
+  await poll();
+  fixture.finish(2, groupAction({ action: 'summary', text: 'Dataset checked' }));
+  await poll();
+  assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:B', host]);
+  assert.deepEqual(groups.decisions(id).map(message => message.text), ['Dataset checked']);
+  assert.equal(groups.decisions(id)[0]?.taskId, original.id);
+  assert.equal(groups.view(id).pending, 0);
+});
+
+test('supplementing a task preserves late native receipts without advancing the old plan', async t => {
+  const fixture = setup(t), groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'supplement');
+  const poll = async () => { await groups.poll(); await groups.poll(); };
+  await poll();
+  const host = 'codex:' + groups.view(id).sessionId;
+
+  groups.send(id, { key: 'task', text: 'Check the old requirements' });
+  const original = must(groups.progress(id));
+  await poll();
+  fixture.finish(0, groupAction({ action: 'collect', questions: [
+    { member: 'B', text: 'Check the old assumptions' }, { member: 'C', text: 'Check the old constraints' },
+  ], summarize: true }));
+  await poll();
+  assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:B']);
+
+  assert.throws(() => groups.send(id, { key: 'missing-version', text: 'Amend', taskAction: 'supplement', taskId: original.id }));
+  const supplement = { key: 'amend', text: 'Use the amended requirements', taskAction: 'supplement',
+    taskId: original.id, taskRevision: original.revision };
+  groups.send(id, supplement);
+  groups.send(id, supplement);
+  const revised = must(groups.progress(id));
+  assert.equal(revised.id, original.id);
+  assert.ok(revised.revision > original.revision);
+  assert.throws(() => groups.send(id, { ...supplement, key: 'stale-change' }), { status: 409 });
+  assert.throws(() => groups.cancel(id, { taskId: original.id, taskRevision: original.revision }), { status: 409 });
+  await poll();
+  assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:B', host]);
+  assert.match(must(fixture.sent[2]).prompt, /Use the amended requirements/);
+  assert.match(must(fixture.sent[2]).prompt, /"remaining":2/, 'the already submitted member still counts toward the task limit');
+
+  fixture.finish(1, 'OLD_REVISION_RESULT');
+  await poll();
+  const late = must(groups.view(id).messages.find(message => message.text === 'OLD_REVISION_RESULT'));
+  assert.equal(late.taskId, original.id);
+  assert.equal(late.taskRevision, original.revision);
+  assert.deepEqual(late.native, { engine: 'dsh', id: 'B', turn: 'turn1' });
+  assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:B', host], 'old receipt must not dispatch the next member');
+  fixture.finish(2, groupAction({ action: 'read', member: 'B', text: 'No replies for the amended requirements yet' }));
+  await poll();
+  assert.equal(fixture.sent.length, 3, 'default reads must not pull the superseded revision into the new request');
+});
+
+test('supplementing before the first native turn keeps the original and new requirements', async t => {
+  const fixture = setup(t), groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'amend-queued');
+  const poll = async () => { await groups.poll(); await groups.poll(); };
+  await poll();
+  const host = 'codex:' + groups.view(id).sessionId;
+  const session = must(must(fixture.histories.get(host)).session);
+  session.status = 'busy';
+  groups.send(id, { key: 'initial', text: 'ORIGINAL_REQUIREMENT' });
+  await poll();
+  assert.equal(fixture.sent.length, 0);
+  const task = must(groups.progress(id));
+  groups.send(id, { key: 'supplement', text: 'ADDED_REQUIREMENT', taskAction: 'supplement', taskId: task.id, taskRevision: task.revision });
+  await poll();
+  assert.equal(fixture.sent.length, 0);
+
+  session.status = 'idle';
+  await poll();
+  assert.deepEqual(fixture.sent.map(message => message.target), [host]);
+  const prompt = must(fixture.sent[0]).prompt;
+  assert.equal(prompt.split('ORIGINAL_REQUIREMENT').length, 2);
+  assert.equal(prompt.split('ADDED_REQUIREMENT').length, 2);
+  assert.match(prompt, /"remaining":3/, 'cancelled unsent work does not consume any delivery budget');
+});
+
+test('the default host read only supplies the current task while replies can quote a specific previous result', async t => {
+  const fixture = setup(t), groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'read-task-scope');
+  const poll = async () => { await groups.poll(); await groups.poll(); };
+  await poll();
+  const host = 'codex:' + groups.view(id).sessionId;
+
+  groups.send(id, { key: 'independent', member: 'B', text: 'Check the earlier draft' });
+  await poll();
+  fixture.finish(0, 'OUTSIDE_TASK_RESULT');
+  await poll();
+  groups.send(id, { key: 'quote-available', member: 'B', text: 'Find a source for reference' });
+  await poll();
+  fixture.finish(1, 'EXPLICIT_REFERENCE');
+  await poll();
+  const earlier = must(groups.view(id).messages.find(message => message.text === 'EXPLICIT_REFERENCE'));
+  groups.send(id, { key: 'current', text: 'Review the new draft', replyTo: earlier.id });
+  const current = must(groups.progress(id));
+  await poll();
+  assert.match(must(fixture.sent[2]).prompt, /EXPLICIT_REFERENCE/, 'an explicit quote can carry a previous result');
+  groups.send(id, { key: 'in-task', member: 'B', text: 'Check this specific draft', replyTo: current.id });
+  await poll();
+  fixture.finish(3, 'CURRENT_TASK_RESULT');
+  await poll();
+  fixture.finish(2, groupAction({ action: 'read', member: 'B' }));
+  await poll();
+  assert.deepEqual(fixture.sent.map(message => message.target), ['dsh:B', 'dsh:B', host, 'dsh:B', host]);
+  const currentContext = must(fixture.sent[4]).prompt;
+  assert.match(currentContext, /CURRENT_TASK_RESULT/);
+  assert.doesNotMatch(currentContext, /OUTSIDE_TASK_RESULT|EXPLICIT_REFERENCE/);
+  assert.equal(groups.view(id).messages.find(message => message.text === 'CURRENT_TASK_RESULT')?.taskId, current.id);
+});
+
+test('stopping follow-up preserves the in-flight native turn without applying its action', async t => {
+  for (const replace of [false, true]) await t.test(replace ? 'replace the active task' : 'cancel before starting another task', async t => {
+    const fixture = setup(t), groups = await fixture.reopen();
+    const { id } = await fixture.create(fixture.codex, 'stop-follow-up');
+    const poll = async () => { await groups.poll(); await groups.poll(); };
+    await poll();
+    const hostId = must(groups.view(id).sessionId);
+    groups.send(id, { key: 'old', text: 'Ask A about the old project' });
+    const original = must(groups.progress(id));
+    await poll();
+    const expected = { taskId: original.id, taskRevision: original.revision };
+    assert.throws(() => groups.cancel(id, { taskId: original.id }));
+    assert.throws(() => groups.send(id, { key: 'missing-version', text: 'Review the new project', taskAction: 'replace', taskId: original.id }));
+    if (!replace) {
+      groups.cancel(id, expected);
+      assert.equal(groups.progress(id)?.state, 'cancelled');
+    }
+    const request = { key: 'new', text: 'Review the new project' };
+    groups.send(id, replace ? { ...request, ...expected, taskAction: 'replace' } : { ...request, taskAction: 'start' });
+    assert.equal(fixture.runs.get('codex', hostId)?.run.status, 'running');
+    const current = must(groups.progress(id));
+    assert.notEqual(current.id, original.id);
+    assert.throws(() => groups.cancel(id, expected), { status: 409 });
+    await poll();
+    assert.equal(fixture.sent.length, 1, 'the next host turn waits for the original native turn');
+
+    fixture.finish(0, groupAction({ action: 'ask', member: 'A', text: 'Late question about the old project' }));
+    await poll();
+    assert.deepEqual(fixture.sent.map(message => message.target), ['codex:' + hostId, 'codex:' + hostId]);
+    assert.match(must(fixture.sent[1]).prompt, /Review the new project/);
+    const late = must(groups.view(id).messages.find(message => message.text.includes('Late question about the old project')));
+    assert.equal(late.taskId, original.id);
+    assert.equal(late.taskRevision, original.revision);
+    assert.deepEqual(late.native, { engine: 'codex', id: hostId, turn: 'turn0' });
+  });
+});
+
+test('after restart, only a proven unsent hosted delivery can be retried', async t => {
+  for (const notSent of [false, true]) await t.test(notSent ? 'desktop refused before submission' : 'submission is uncertain', async t => {
+    const fixture = setup(t);
+    let groups = await fixture.reopen();
+    const { id } = await fixture.create(fixture.codex, 'retry-host');
+    const poll = async () => { await groups.poll(); await groups.poll(); };
+    await poll();
+    groups.send(id, { key: 'task', text: 'Review the draft' });
+    await poll();
+    const first = must(fixture.sent[0]);
+    const delivery = must(groups.progress(id)?.deliveries[0]);
+    first.emitter.emit('error', Object.assign(new Error('Transport closed'), { notSent }));
+    groups = await fixture.reopen(true);
+    await poll();
+    assert.equal(fixture.sent.length, 1, 'restarting does not retry either case');
+    if (notSent) {
+      assert.equal(groups.progress(id)?.state, 'blocked');
+      assert.equal(groups.progress(id)?.deliveries[0]?.note, 'Transport closed');
+      groups.retryDelivery(id, delivery.id);
+      await poll();
+      assert.equal(fixture.sent.length, 2);
+      assert.equal(fixture.sent[1]?.prompt, first.prompt);
+    } else {
+      assert.equal(groups.progress(id)?.state, 'confirming');
+      assert.throws(() => groups.retryDelivery(id, delivery.id), { status: 409 });
+      assert.equal(fixture.sent.length, 1);
+    }
+  });
+});
 
 test('removing an unrelated member preserves the assigned discussion and an in-flight decision', async t => {
   const fixture = setup(t);
@@ -511,7 +739,7 @@ test('two hosts can share a member without sharing private messages or resending
   await groups.poll();
   assert.deepEqual(fixture.sent.map(item => item.target), ['dsh:B']);
   assert.equal(groups.view(second.id).deliveries[0]?.state, 'queued');
-  groups = await fixture.reopen();
+  groups = await fixture.reopen(true);
   must(fixture.histories.get('dsh:B')).turns.push(turn('private', 'Desktop question', 'Private conversation'));
   await groups.poll();
   assert.equal(fixture.sent.length, 1);
@@ -634,7 +862,7 @@ test('explicit member context reads keep omitted and failed pages available and 
   groups.send(id, { key: 'read', text: 'Summarize all of B’s new replies' });
   await poll();
   assert.doesNotMatch(must(fixture.sent[14]).prompt, /REPLY_0_END|EXTRA_REPLY/);
-  fixture.finish(14, action({ action: 'read', member: 'B' }));
+  fixture.finish(14, action({ action: 'read', member: 'B', scope: 'group' }));
   await poll();
   const firstPage = must(fixture.sent[15]);
   assert.match(firstPage.prompt, /REPLY_0_END/);
@@ -647,13 +875,13 @@ test('explicit member context reads keep omitted and failed pages available and 
 
   groups.send(id, { key: 'retry', text: 'Try reading B’s replies again' });
   await poll();
-  fixture.finish(16, action({ action: 'read', member: 'B' }));
+  fixture.finish(16, action({ action: 'read', member: 'B', scope: 'group' }));
   await poll();
   assert.match(must(fixture.sent[17]).prompt, /REPLY_0_END/);
   groups = await fixture.reopen();
   await poll();
   assert.equal(fixture.sent.length, 18, 'an unconfirmed context delivery is not resent');
-  fixture.finish(17, action({ action: 'read', member: 'B' }));
+  fixture.finish(17, action({ action: 'read', member: 'B', scope: 'group' }));
   await poll();
   const finalPage = must(fixture.sent[18]).prompt;
   assert.match(finalPage, /REPLY_12_END/);
@@ -661,7 +889,7 @@ test('explicit member context reads keep omitted and failed pages available and 
   assert.doesNotMatch(finalPage, /REPLY_0_END|EXTRA_REPLY/);
 });
 
-test('HTTP group directory and member candidates use the same adapter as the controller tool', async t => {
+test('the HTTP group API serves task progress and cancellation alongside the existing directory', async t => {
   const fixture = setup(t);
   const config = { ...loadConfig(), settingsFile: path.join(fixture.directory, 'settings.json'), uploadsDir: fixture.directory, exportsDir: fixture.directory };
   const context = await createApp({ config, host: fixture.host });
@@ -678,6 +906,31 @@ test('HTTP group directory and member candidates use the same adapter as the con
   assert.equal(members.length, 1);
   assert.equal(members[0].id, 'B');
   assert.deepEqual(fixture.reads, []);
+
+  const host = new UnifiedSession({ id: 'http-host', engine: 'codex', cwd: fixture.directory, status: 'busy' });
+  fixture.histories.set('codex:' + host.id, { session: host, turns: [] });
+  const post = (route: string, body: object) => fetch(base + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const createdResponse = await post('/api/groups/codex/create', { key: 'http-group', name: 'HTTP group', hostSession: host.id });
+  assert.equal(createdResponse.status, 202);
+  const room: GroupView = await createdResponse.json();
+  const route = '/api/groups/' + room.id;
+  assert.equal(await (await fetch(base + route + '/task')).json(), null);
+  const startedResponse = await post(route + '/messages', { key: 'task', text: 'Review the draft' });
+  assert.equal(startedResponse.status, 202);
+  const started: GroupView = await startedResponse.json();
+  const progressResponse = await fetch(base + route + '/task');
+  assert.equal(progressResponse.status, 200);
+  const progress: GroupTask = await progressResponse.json();
+  assert.equal(progress.id, started.task?.id);
+  assert.equal(progress.state, 'queued');
+  const stopResponse = await post(route + '/task/cancel', { taskId: progress.id, taskRevision: progress.revision });
+  assert.equal(stopResponse.status, 200);
+  const stopped: GroupView = await stopResponse.json();
+  assert.equal(stopped.task?.state, 'cancelled');
+  assert.equal(stopped.task?.deliveries[0]?.outcome, 'cancelled');
+  assert.equal(fixture.sent.length, 0);
 });
 
 test('directory pagination and a specific group read leave one hundred idle native chats untouched', async t => {

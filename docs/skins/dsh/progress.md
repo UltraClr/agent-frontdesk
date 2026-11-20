@@ -1,6 +1,8 @@
 # DeepSeek Harness
 
-The desktop profile loads the local companion in `integrations/dsh-frontdesk-bridge`. Frontdesk talks only to that companion on loopback. DSH runs the turn and keeps its session log and settings. The companion publishes its own connection information in `~/.dsh/frontdesk-bridge.json` with mode 0600.
+Install the local package from `integrations/dsh-frontdesk-bridge` in your DSH desktop profile, enable **Agent Frontdesk bridge** in **Settings → Plugins**, then restart DSH. Start Frontdesk and open **DeepSeek Harness** from the rail. Frontdesk talks only to that companion on loopback. DSH runs the turn and keeps its session log and settings.
+
+The companion writes its connection information to `frontdesk-bridge.json` in the DSH data folder with mode 0600. The default data folder is `~/.dsh`. If the data folder is customized, set `DSH_HOME` to the same directory in both processes. If you move the connection file using the plugin's `stateFile` option, set `DSH_FRONTDESK_BRIDGE_FILE` on Frontdesk to that path.
 
 | Action | Desktop interface | Behavior |
 |---|---|---|

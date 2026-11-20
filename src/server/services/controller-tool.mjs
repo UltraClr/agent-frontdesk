@@ -22,7 +22,10 @@ if (!op || op === 'help') {
     'group-find': { query: 'name, topic or member', after: 'ISO datetime', before: 'ISO datetime', offset: 0 },
     'group-open': { group: 'group-id', before: 'optional message cursor' },
     'group-decisions': { group: 'group-id' },
-    'group-send': { group: 'group-id', key: 'stable request key', text: 'message', member: 'optional member alias or JSON.stringify([engine,id]); omit to ask host', replyTo: 'optional message ID' },
+    'group-progress': { group: 'group-id; reads the task and delivery receipts without sending a message' },
+    'group-send': { group: 'group-id', key: 'stable request key', text: 'message', member: 'optional member alias or JSON.stringify([engine,id]); omit to ask host', replyTo: 'optional message ID',
+      taskAction: 'optional start; use supplement or replace only when explicitly requested', taskId: 'current group task ID for supplement or replace', taskRevision: 'revision returned by group-progress' },
+    'group-cancel': { group: 'group-id', taskId: 'current group task ID; stops future dispatches, keeps native receipts for sent turns', taskRevision: 'revision returned by group-progress' },
     'group-report': { group: 'group-id', key: 'stable report key', message: 'conclusion message ID' },
   }, null, 2));
 } else {
