@@ -4,16 +4,15 @@
 
 # Agent Frontdesk
 
-**One web page for every desktop AI on your computer.**<br>
-To add a new one, send it a prompt and it connects itself.
+**Coordinate work across the desktop AI chats you already use.**<br>
+The collaboration fork of [Phz-06/agent-frontdesk](https://github.com/Phz-06/agent-frontdesk).
 
-[![CI](https://github.com/Phz-06/agent-frontdesk/actions/workflows/ci.yml/badge.svg)](https://github.com/Phz-06/agent-frontdesk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: macOS · Windows 11](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows%2011-lightgrey.svg)
 ![Node 22.16+](https://img.shields.io/badge/node-%E2%89%A5%2022.16-brightgreen.svg)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange.svg)](CONTRIBUTING.md)
 
-[Quick start](#quick-start) · [Add an AI](#add-an-ai) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [简体中文](README.zh-CN.md)
+[What this fork adds](#what-this-fork-adds) · [Quick start](#quick-start) · [Add an AI](#add-an-ai) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [简体中文](README.zh-CN.md)
 
 <table>
 <tr>
@@ -38,11 +37,20 @@ To add a new one, send it a prompt and it connects itself.
 
 </div>
 
-## Why
+## What this fork adds
 
-We subscribe to several AIs, and each one has its own desktop app. Working with them meant switching between windows all day and trying to remember which one was running and how far it had got.
+The original Agent Frontdesk brings existing desktop AI chats into one web console. It supports continuing chats, handling approvals and quoting one chat in another. Your desktop apps run the work and keep the native history.
 
-Agent Frontdesk puts those desktop apps into one web page. The apps still do the work, on your own account and subscription. The page only carries your messages over and brings the progress back. Both sides are the same session, so you can go back to the desktop app and carry on at any time.
+This branch lets several native chats work on one task. For example, ask the coordinator to find two existing chats, have them review the same change, and check progress while they work. The group results link back to the desktop turns that produced them.
+
+| Addition | What you can do |
+| --- | --- |
+| [Coordinator](#coordinator) | Use a dedicated Codex or Antigravity chat to find, remember and delegate to existing sessions. Receipts show the instruction, the reply and any delivery still being confirmed. |
+| [Group tasks](#groups) | Combine existing chats with dedicated group members. Check progress without starting a new desktop turn, amend or replace a task, and see which revision each result belongs to. Hosts and members keep their native context and receive selected excerpts. |
+| [WeChat](#message-the-coordinator-from-wechat) | Send private text to a paired coordinator and receive its replies. Approvals and plan decisions use the desktop workflow. |
+| Additional engines and inbox views | Use the optional [DeepSeek Harness bridge](docs/skins/dsh/progress.md) to send to DSH. Browse [WorkBuddy history](docs/skins/workbuddy/progress.md) and jump to its desktop app for sending. Find recent unread chats, desktop pins and requests that need your input. |
+
+Codex and Antigravity can act as coordinators or start new group hosts. Existing Codex, Antigravity, Claude and DSH chats can join groups when their adapters support sending. Automated tests exercise group dispatch and recovery with simulated desktop sessions. Live behavior depends on the engine and desktop version.
 
 ## Features
 
@@ -63,7 +71,7 @@ Agent Frontdesk puts those desktop apps into one web page. The apps still do the
 You need macOS or Windows 11 and [Node.js](https://nodejs.org) 22.16 or later. Nothing else is installed: the helper that works the desktop apps' windows is compiled on your machine, with Xcode's command line tools on macOS and with the C# compiler that ships with Windows (.NET Framework 4) on Windows.
 
 ```sh
-git clone https://github.com/Phz-06/agent-frontdesk.git
+git clone --branch frontdesk-collaboration https://github.com/UltraClr/agent-frontdesk.git
 cd agent-frontdesk
 npm ci
 npm start
@@ -71,7 +79,7 @@ npm start
 
 Open <http://127.0.0.1:4100>. Every AI whose desktop app is installed shows up in the rail, and you can switch them on and off under **+**.
 
-Codex, Claude and Antigravity are connected so far. Open the desktop app and sign in before you use one.
+Open and sign in to the desktop apps you want to use. The built-in desktop engines are Codex, Claude and Antigravity. See the [DSH setup guide](docs/skins/dsh/progress.md) to enable sending with DSH.
 
 On macOS, sending to Codex and Claude needs the Accessibility permission. In System Settings → Privacy & Security → Accessibility, allow the terminal app you run `npm start` in, then start Frontdesk again. On Windows 11 there is no permission to grant; run Frontdesk with the same rights as the desktop apps (both as administrator, or neither), since Windows lets a program read a window of a higher-rights app but not act on it. For now, keep the desktop apps' interface in English.
 

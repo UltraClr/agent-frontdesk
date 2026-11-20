@@ -4,16 +4,15 @@
 
 # Agent Frontdesk
 
-**一个网页，用上你电脑里所有的桌面版 AI。**<br>
-想加新的 AI，把一段提示词发给它，它自己接进来。
+**让你已经在用的桌面 AI 会话一起完成任务。**<br>
+基于 [Phz-06/agent-frontdesk](https://github.com/Phz-06/agent-frontdesk) 的协作版 fork。
 
-[![CI](https://github.com/Phz-06/agent-frontdesk/actions/workflows/ci.yml/badge.svg)](https://github.com/Phz-06/agent-frontdesk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: macOS · Windows 11](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows%2011-lightgrey.svg)
 ![Node 22.16+](https://img.shields.io/badge/node-%E2%89%A5%2022.16-brightgreen.svg)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-orange.svg)](CONTRIBUTING.md)
 
-[快速开始](#快速开始) · [接入新的 AI](#接入新的-ai) · [工作原理](#工作原理) · [未来计划](#未来计划) · [English](README.md)
+[与原仓库的区别](#与原仓库的区别) · [快速开始](#快速开始) · [接入新的 AI](#接入新的-ai) · [工作原理](#工作原理) · [未来计划](#未来计划) · [English](README.md)
 
 <table>
 <tr>
@@ -38,11 +37,20 @@
 
 </div>
 
-## 为什么做这个
+## 与原仓库的区别
 
-我们手上有好几家 AI 的订阅，每家一个桌面应用。干活的时候要在几个窗口之间来回切，还得记着刚才是谁在跑、跑到哪一步了，很麻烦。
+原版 Agent Frontdesk 把几个桌面 AI 放到同一个网页里，可以续接原会话、处理审批，也可以在一个会话里引用另一个。执行与原生聊天记录由各自的桌面应用负责。
 
-Agent Frontdesk 把这些桌面应用放进同一个网页。干活的还是各家的桌面应用，用的是你自己的账号和订阅，网页只负责把消息送过去、把进度拿回来。两边是同一个会话，随时可以切回桌面版接着聊。
+这个分支让几个现有会话可以围绕同一项任务协作。比如请总控找出两个正在做相关工作的会话，让它们核对同一份改动。执行中可以查看进度，群里的结果可以点回原生轮次。
+
+| 新增能力 | 可以怎么用 |
+| --- | --- |
+| [总控](#总控) | 用独立的 Codex 或 Antigravity 会话查找、记住并向已有会话派发任务。回执记录原指令、回复和待确认的投递。 |
+| [群任务](#群聊) | 把已有会话和群专用成员放在一起。查进度无需唤起桌面，可补充或替换任务，结果归到对应版本。群主和成员沿用各自的原生上下文，按需接收摘录。 |
+| [微信](#用微信给总控发消息) | 用已绑定的微信私聊发文字给总控并收回复。审批和计划确认通过桌面流程处理。 |
+| 新接入和收件箱视图 | 通过可选的[桌面桥接插件](docs/skins/dsh/progress.md)向 DeepSeek Harness 发送消息。可[浏览 WorkBuddy 历史](docs/skins/workbuddy/progress.md)，发送时回到 WorkBuddy。侧栏可集中查看最近未读、原生置顶和待处理事项。 |
+
+Codex 和 Antigravity 可担任总控，也可新建群主。Codex、Antigravity、Claude 和 DSH 的已有会话在适配器支持发送时可以参与群聊。群任务的派发与恢复由模拟桌面会话的自动化测试覆盖，实际桌面行为取决于引擎和应用版本。
 
 ## 能做什么
 
@@ -63,7 +71,7 @@ Agent Frontdesk 把这些桌面应用放进同一个网页。干活的还是各�
 需要 macOS 或 Windows 11 和 [Node.js](https://nodejs.org) 22.16 以上，不用另外安装别的：操作桌面应用窗口的辅助程序在你的电脑上现场编译，macOS 用 Xcode 命令行工具，Windows 用系统自带的 C# 编译器（.NET Framework 4）。
 
 ```sh
-git clone https://github.com/Phz-06/agent-frontdesk.git
+git clone --branch frontdesk-collaboration https://github.com/UltraClr/agent-frontdesk.git
 cd agent-frontdesk
 npm ci
 npm start
@@ -71,7 +79,7 @@ npm start
 
 打开 <http://127.0.0.1:4100>。电脑上装了哪个桌面应用，哪个 AI 就会出现在左边一栏里，之后可以在栏里的 **+** 中开关。
 
-目前已经接好的有 Codex、Claude 和 Antigravity，用之前先把对应的桌面应用打开并登录。
+内置的桌面引擎有 Codex、Claude 和 Antigravity，用之前先打开对应的应用并登录。要向 DSH 发送消息，按 [DSH 接入说明](docs/skins/dsh/progress.md)启用桌面桥接插件。
 
 在 macOS 上，给 Codex 和 Claude 发消息需要辅助功能权限：在「系统设置 → 隐私与安全性 → 辅助功能」里允许你运行 `npm start` 的那个终端应用，然后重新启动 Frontdesk。Windows 11 没有要授予的权限，但 Frontdesk 要和桌面应用以相同的权限运行（都以管理员身份，或都不是）：Windows 允许程序读取更高权限应用的窗口，但不允许操作它。桌面应用的界面语言建议先用英文。
 
