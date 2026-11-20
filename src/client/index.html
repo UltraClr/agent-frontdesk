@@ -15,7 +15,11 @@
 <body>
   <a class="skip-link" href="#prompt">跳到输入框</a>
   <header class="control-bar" aria-label="引擎快捷切换">
-    <div class="control-brand" title="Agent Frontdesk"><img class="brand-logo" src="/assets/logo/logo-128.png" width="36" height="36" alt="" aria-hidden="true"><span>Agent Frontdesk</span></div>
+    <button type="button" class="control-brand" id="open-coordinator" aria-label="总控" aria-describedby="coordinator-quota" aria-pressed="false">
+      <span class="control-brand-icon"><img class="brand-logo" src="/assets/logo/logo-128.png" width="36" height="36" alt=""><span id="coordinator-meter" aria-hidden="true"></span></span>
+      <span class="control-brand-label">总控</span>
+      <span id="coordinator-quota"></span>
+    </button>
     <nav id="engine-dock" class="engine-dock" aria-label="快速切换引擎"><span class="quiet-state">正在连接引擎…</span></nav>
     <button class="dock-add" id="add-engine" aria-label="添加 Agent" title="添加 Agent" aria-haspopup="dialog"><i data-lucide="plus"></i><span>添加 Agent</span></button>
     <div class="rail-foot">
@@ -37,7 +41,9 @@
       <button class="new-chat" id="new-chat" aria-keyshortcuts="Meta+Shift+O Control+Shift+O"><i data-lucide="square-pen"></i><span>新建聊天</span><kbd data-keys="mod+shift+O">⌘⇧O</kbd></button>
       <label class="search"><i data-lucide="search"></i><input type="search" id="session-search" placeholder="搜索聊天" aria-label="搜索聊天"><kbd data-keys="mod+K">⌘K</kbd></label>
     </div>
+    <div class="sidebar-view-bar"><button type="button" class="sidebar-view" id="sidebar-view" title="列表显示" aria-haspopup="listbox" aria-expanded="false"><i data-lucide="list-filter"></i><span id="sidebar-view-label">全部会话</span><i data-lucide="chevron-down"></i></button></div>
     <nav class="session-list" id="session-list" aria-label="聊天列表"><p class="quiet-state">正在读取会话…</p></nav>
+    <section class="session-list coordinator-pane" id="coordinator-pane" aria-label="总控" hidden></section>
     <div class="sidebar-resize" id="sidebar-resize" role="separator" aria-orientation="vertical" aria-label="拖动调整会话列表宽度，双击恢复默认" tabindex="0"></div>
   </aside>
   <main class="workspace" id="workspace">
@@ -54,6 +60,7 @@
     <div class="notice" id="notice" role="alert" hidden><span id="notice-text"></span><button class="icon-button" id="dismiss-notice" aria-label="关闭提示"><i data-lucide="x"></i></button></div>
     <section class="conversation" id="conversation" aria-label="聊天内容" tabindex="0">
       <div class="timeline" id="timeline"></div>
+      <aside id="unassigned-receipts" class="dispatch-history" hidden></aside>
     </section>
     <div class="composer-area">
       <button class="jump-button" id="jump-bottom" aria-label="回到最新消息" title="回到最新消息" hidden><i data-lucide="arrow-down"></i></button>
@@ -84,6 +91,7 @@
       <div class="composer-caption"><span id="composer-context">任务在对应桌面引擎中执行</span><span>Enter 发送 · Shift Enter 换行</span></div>
     </div>
     <div class="drop-zone" id="drop-zone" hidden>松开以添加附件</div>
+    <section class="group-panel" id="group-panel" hidden></section>
   </main>
   <aside class="side-panel" id="side-panel" aria-label="文件预览" hidden>
     <div class="side-resize" id="side-resize" role="separator" aria-orientation="vertical" aria-label="拖动调整侧边栏宽度" tabindex="0"></div>
@@ -114,6 +122,10 @@
     <div class="dialog-heading"><h2 id="usage-title">额度</h2><button class="icon-button" id="close-usage" aria-label="关闭"><i data-lucide="x"></i></button></div>
     <div id="usage-content"></div>
     <p class="field-help">显示引擎实际返回的剩余额度与重置时间，自动更新；未提供数据的引擎以原客户端为准</p>
+  </dialog>
+  <dialog id="weixin-dialog" class="settings-dialog weixin-dialog" aria-labelledby="weixin-title">
+    <div class="dialog-heading"><h2 id="weixin-title">微信</h2><button type="button" class="icon-button" data-close aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <div class="weixin-content"></div><p class="weixin-status" role="status"></p>
   </dialog>
   <dialog id="onboard-dialog" class="onboard-dialog" aria-labelledby="onboard-title">
     <div class="dialog-heading"><h2 id="onboard-title">接入新的桌面 AI</h2><button class="icon-button" id="close-onboard" aria-label="关闭"><i data-lucide="x"></i></button></div>

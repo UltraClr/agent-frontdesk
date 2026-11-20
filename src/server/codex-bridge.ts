@@ -12,11 +12,11 @@ import { NATIVE } from './paths.js';
 import { loadConfig, winSpawnArgs } from './config.js';
 import EventEmitter from 'node:events';
 import { CodexLifecycle, resolveCodexTurn } from './services/codex-lifecycle.js';
-import { changesOf, questionCard } from './core/presentation.js';
+import { changesOf, desktopCard, questionCard } from './core/presentation.js';
 import { withAttachments } from './core/attachments.js';
 import { characterReferences, promptStarts } from '../shared/turn-match.js';
 import * as codexDesktop from './codex-desktop.js';
-import type { CodexDesktopIpc, CodexInput, DesktopRequest, ThreadSettings } from './codex-desktop.js';
+import type { CodexDesktopIpc, CodexInput, DesktopRequest, DesktopTurn, Watcher, ThreadSettings } from './codex-desktop.js';
 import { DesktopAutomation, throughFullscreen, FULLSCREEN_EVERY_MS, FULLSCREEN_HOLD_MS, type DesktopFlags } from './core/desktop-automation.js';
 import { CodexProjects } from './services/codex-projects.js';
 import { openLink } from './services/desktop-places.js';
@@ -65,10 +65,29 @@ function shownSettings(shownText: unknown, models: Model[] = []): DesktopSetting
 // What the desktop waits on the person for, as a card in the chat (its id: thread and request):
 // the agent's own question (request_user_input), or running a command / changing files.
 function askCard(threadId: string, request: unknown): Approval | null {
-  const id = `${threadId}:${get(request, 'id')}`, params = get(request, 'params') || {}, method = get(request, 'method');
+  const requestId = get(request, 'id'), params = get(request, 'params'), method = get(request, 'method');
+  if ((typeof requestId !== 'string' && typeof requestId !== 'number') || (get(params, 'threadId') ?? threadId) !== threadId) return null;
+  const id = `${threadId}:${requestId}`;
   if (method === 'item/tool/requestUserInput') {
-    return questionCard(id, list(get(params, 'questions')).map(item => ({ question: text(get(item, 'question') || get(item, 'header') || ''), multi: false, options: get(item, 'isSecret') ? [] : list(get(item, 'options')).map(option => ({ id: String(get(option, 'label')), label: text(get(option, 'label')) })) })), 'Codex');
+    const native = list(get(params, 'questions'));
+    const questions = native.map(item => {
+      const options = list(get(item, 'options')).flatMap(option => {
+        const label = str(get(option, 'label'));
+        return label ? [{ label, description: text(get(option, 'description')) }] : [];
+      });
+      return { id: text(get(item, 'id')), prompt: text(get(item, 'question') || get(item, 'header')), options, freeform: !!get(item, 'isOther') || !options.length };
+    });
+    if (!questions.length || questions.some(item => !item.id) || native.some(item => get(item, 'isSecret'))) {
+      return { ...desktopCard(id, 'Codex 正在等待你的回答', questions.map(item => item.prompt).join('\n')), kind: 'input' };
+    }
+    const [only] = questions;
+    if (questions.length === 1 && only && !only.freeform && only.options.every(option => !option.description)) {
+      return { ...questionCard(id, [{ question: only.prompt, options: only.options.map(({ label }) => ({ id: label, label })) }], 'Codex'), kind: 'input' };
+    }
+    return { id, title: 'Codex 正在等待你的回答', detail: '', kind: 'input', decisions: [], questions };
   }
+  if (method === 'item/tool/requestOptionPicker' && get(params, 'threadId') === threadId) return { ...desktopCard(id, 'Codex 正在等待你选择选项'), kind: 'input' };
+  if (method === 'item/plan/requestImplementation') return { ...desktopCard(id, '执行这份计划？'), kind: 'plan' };
   const command = get(params, 'command');
   if (method === 'item/commandExecution/requestApproval') return { id, title: 'Codex 要运行这条命令', detail: [arr(command)?.join(' ') ?? command, get(params, 'reason')].filter(Boolean).join('\n'), decisions: ['accept', 'decline'] };
   if (method === 'item/fileChange/requestApproval') return { id, title: 'Codex 要修改文件', detail: [get(params, 'reason'), get(params, 'grantRoot')].filter(Boolean).join('\n'), decisions: ['accept', 'decline'] };
@@ -95,12 +114,34 @@ class CodexRun extends EngineEvents {
 }
 
 type Reply = (message: unknown) => void;
-interface Ask { threadId: string; request: DesktopRequest }
+interface Ask { card: Approval; request: DesktopRequest }
+interface LiveThread {
+  listeners: Set<() => void>;
+  liveTurns: unknown[];
+  replyListeners: Set<(turns: unknown[]) => void>;
+  asks: Map<string, Ask>;
+  turns: Map<string, DesktopTurn>;
+  owner?: string | null;
+  answering: Set<string>;
+  watcher?: Watcher;
+}
+
+function planItemsOf(rawTurn: unknown, live?: DesktopTurn): unknown[] {
+  const items = [...list(get(rawTurn, 'items'))];
+  for (const item of live?.planItems || []) {
+    if (!item['text']) continue;
+    const index = items.findIndex(raw => get(raw, 'type') === 'plan' && get(raw, 'id') === item.id);
+    if (index < 0) items.push(item);
+    else if (!text(get(items[index], 'text')).startsWith(text(item['text']))) items[index] = { ...bag(items[index]), ...item };
+  }
+  if (live?.checklist) items.push(live.checklist);
+  return items;
+}
 
 class CodexBridge extends EventEmitter {
   codexBin: string | null | undefined;
   desktop: CodexDesktopIpc;
-  asks: Map<string, Ask>;
+  private live = new Map<string, LiveThread>();
   ui: DesktopAutomation;
   starts: Map<string, CodexRun>;
   config: Partial<BridgeConfig>;
@@ -120,7 +161,6 @@ class CodexBridge extends EventEmitter {
     super();
     this.codexBin = config.codexBin;
     this.desktop = codexDesktop; // the desktop's IPC (steer, stop, what it asks); replaceable in tests
-    this.asks = new Map(); // card id → { threadId, request }: what the desktop is waiting on the person for
     this.ui = new DesktopAutomation({ engine: 'codex', label: 'Codex 桌面版' }); // its window, through Accessibility
     this.starts = new Map(); // threadId -> the run create() started, until observed
     this.config = config;
@@ -182,6 +222,8 @@ class CodexBridge extends EventEmitter {
   dispose(): void {
     this.stopping = true;
     for (const emitter of this.starts.values()) emitter.emit('interrupt');
+    for (const entry of this.live.values()) entry.watcher?.close();
+    this.live.clear();
     this.failPending(new Error('Bridge stopped'));
     this.rl?.close(); this.proc?.kill();
   }
@@ -284,26 +326,50 @@ class CodexBridge extends EventEmitter {
 
   async listProjects(): Promise<Project[]> {
     await this.start();
-    return (await this.projectTree()).projects.map(project => ({ id: project.id, name: project.name, cwd: project.roots[0] || '' }));
+    return (await this.projectTree()).projects.map(project => ({ id: project.id, name: project.name, cwd: project.roots[0] || '', ...(project.pinned && { pinned: true }) }));
+  }
+
+  async coordinationCatalog(cwd?: string) {
+    await this.start();
+    const [rows, tree] = await Promise.all([this.listAll('thread/list', { archived: false }), this.projectTree()]);
+    return rows.flatMap(row => {
+      const id = text(get(row, 'id')), folder = text(get(row, 'cwd'));
+      if (!id || (cwd && (!folder || path.resolve(folder) !== cwd))) return [];
+      const project = tree.resolve({ id, projectId: get(row, 'projectId'), cwd: folder });
+      return [{ id, title: this.titleOf(row), cwd: folder, updatedAt: timeOf(get(row, 'updatedAt') || get(row, 'createdAt')) || '', ...(project ? { project: project.name } : {}) }];
+    });
   }
 
   async listThreads(): Promise<UnifiedSession[]> {
     await this.start();
     const [rows, tree] = await Promise.all([this.listAll('thread/list'), this.projectTree()]);
-    const threads = [...new Map(rows.map(thread => [get(thread, 'id'), thread])).values()];
-    return Promise.all(threads.map(async t => {
+    const pins = this.projectIndex.desktop().pinnedThreads;
+    const threads = new Map(rows.map(thread => [get(thread, 'id'), thread]));
+    // The desktop's pins span providers; its default thread/list can omit older pinned chats.
+    const missing = [...pins.keys()].filter(id => !threads.has(id));
+    await Promise.all(missing.map(async id => {
+      try {
+        const thread = await this.readThread(id);
+        if (get(thread, 'id') === id && !text(get(thread, 'path')).split(/[\\/]/).includes('archived_sessions')) threads.set(id, thread);
+      } catch { /* A stale pin has no readable native thread. */ }
+    }));
+    return Promise.all([...threads.values()].map(async t => {
       const log = await this.lifecycle.read(str(get(t, 'path')));
       const shownStatus = get(t, 'status', 'type') || get(t, 'status');
       const nativeRunning = typeof shownStatus === 'string' && ['busy', 'active', 'running'].includes(shownStatus);
       const cwd = text(log.cwd || get(t, 'cwd'));
       const id = text(get(t, 'id'));
+      const request = this.live.get(id)?.asks.values().next().value?.card;
+      const flags = list(get(t, 'status', 'activeFlags'));
+      const waitingFor = request ? request.kind || 'approval'
+        : flags.includes('waitingOnUserInput') ? 'input' : flags.includes('waitingOnApproval') ? 'approval' : undefined;
       const project = tree.resolve({ id, projectId: get(t, 'projectId'), cwd });
       return new UnifiedSession({
         id, engine: 'codex', title: this.titleOf(t),
         updatedAt: timeOf(get(t, 'updatedAt') || get(t, 'createdAt')), cwd,
         status: nativeRunning || log.latest?.status === 'running' ? 'busy' : log.latest ? 'idle' : 'unknown',
         isDesktopActive: true,
-        metadata: { model: strOrNull(get(t, 'model')), modelProvider: get(t, 'modelProvider'), historyMode: get(t, 'historyMode'),
+        metadata: { waitingFor, pinnedRank: pins.get(id), model: strOrNull(get(t, 'model')), modelProvider: get(t, 'modelProvider'), historyMode: get(t, 'historyMode'),
           // What the next turn runs with, as the desktop shows it: the console's menus start on it.
           desktop: { model: text(get(t, 'model')), effort: text(get(t, 'reasoningEffort')) },
           // The thread's project in the desktop sidebar; null = a chat outside every project.
@@ -330,8 +396,17 @@ class CodexBridge extends EventEmitter {
     const turns = list(get(rawThread, 'turns'));
     const lifecycle = await this.lifecycle.read(str(get(rawThread, 'path')));
 
+    const live = this.live.get(threadId);
     const unifiedTurns = turns.map(rawTurn => {
-      const items = list(get(rawTurn, 'items'));
+      const turnId = text(get(rawTurn, 'id'));
+      const native = live?.turns.get(turnId);
+      const items = planItemsOf(rawTurn, native);
+      const pending = [...(live?.asks.values() || [])].filter(ask => get(ask.request.params, 'turnId') === turnId);
+      const implementation = pending.find(ask => ask.card.kind === 'plan');
+      const proposed = str(get(implementation?.request.params, 'planContent'));
+      if (proposed && !items.some(item => get(item, 'type') === 'plan' && get(item, 'text'))) {
+        items.push({ id: implementation?.card.id, type: 'plan', text: proposed });
+      }
       let userPrompt = '', sawPrompt = false;
       let assistantReply = '';
       const steps: UnifiedStep[] = [];
@@ -345,6 +420,12 @@ class CodexBridge extends EventEmitter {
           // The first is the turn's prompt; later ones were sent into the running turn (steer).
           if (!sawPrompt) { userPrompt = said; sawPrompt = true; }
           else steps.push(new UnifiedStep({ id, type: 'user_message', title: said, status: 'completed' }));
+        } else if (type === 'plan') {
+          const plan = str(field(item, 'text'));
+          if (plan) {
+            messages.push({ id, phase: 'plan', text: plan });
+            assistantReply += (assistantReply ? '\n' : '') + plan;
+          }
         } else if (type === 'agentMessage') {
           const content = field(item, 'content');
           const said = text(field(item, 'text') || (content ? list(content).map(c => text(get(c, 'text'))).join('') : ''));
@@ -416,9 +497,9 @@ class CodexBridge extends EventEmitter {
           }));
         }
       }
+      if (native?.checklist) steps.push(new UnifiedStep({ id: native.checklist.id, type: 'todo-list', plan: native.checklist.plan }));
 
       const firstPrompt = items.findIndex(other => get(other, 'type') === 'userMessage');
-      const turnId = text(get(rawTurn, 'id'));
       return new UnifiedTurn({
         id: turnId,
         userPrompt,
@@ -429,7 +510,8 @@ class CodexBridge extends EventEmitter {
         ...resolveCodexTurn(bag(rawTurn) || {}, lifecycle.turns.get(turnId)),
         steps,
         assistantReply,
-        artifacts: [], messages, timeline: items.filter((item, index) => !(get(item, 'type') === 'userMessage' && index === firstPrompt) && get(item, 'type') !== 'sleep' && !(get(item, 'type') === 'reasoning' && !reasoningText(item))).map(item => ({ kind: get(item, 'type') === 'agentMessage' ? 'message' : 'activity', id: text(get(item, 'id')) }))
+        approvals: pending.map(ask => ask.card),
+        artifacts: [], messages, timeline: items.filter((item, index) => !(get(item, 'type') === 'userMessage' && index === firstPrompt) && get(item, 'type') !== 'sleep' && !(get(item, 'type') === 'reasoning' && !reasoningText(item))).map(item => ({ kind: ['agentMessage', 'plan'].includes(text(get(item, 'type'))) ? 'message' : 'activity', id: text(get(item, 'id')) }))
       });
     });
 
@@ -552,6 +634,12 @@ class CodexBridge extends EventEmitter {
   }
   // Takes the person to this thread in the desktop app.
   async show(threadId: string): Promise<unknown> {
+    if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(threadId)) {
+      await openLink('codex://threads/' + threadId, { foreground: true }).catch((cause: unknown) => {
+        throw Object.assign(new Error('没能在 Codex 桌面版里打开这个会话'), { status: 409, cause });
+      });
+      return { ok: true };
+    }
     const state = await this.ui.check();
     if (!state.available) throw Object.assign(new Error(state.reason), { status: 409 });
     const result = await this.ui.showSession({ title: this.titleOf(await this.readThread(threadId)) });
@@ -563,9 +651,20 @@ class CodexBridge extends EventEmitter {
     return get(await this.send('thread/read', { threadId, includeTurns }), 'result', 'thread') || {};
   }
 
+  // The link opens a desktop-owned draft. It never sends text. Frontdesk binds only after
+  // this setup message has a native thread ID in the requested working directory.
+  async prepareCoordinator(cwd: string, prompt: string): Promise<void> {
+    const url = new URL('codex://threads/new');
+    url.searchParams.set('path', cwd);
+    url.searchParams.set('prompt', prompt);
+    await openLink(url.href, { foreground: true }).catch((cause: unknown) => {
+      throw Object.assign(new Error('没能在 Codex 桌面版里打开总控草稿'), { status: 409, cause });
+    });
+  }
+
   async create(input: CreateInput = {}): Promise<CreateResult> {
-    function refuse(reason: string | undefined): never { throw Object.assign(new Error(reason), { status: 409 }); }
-    if (!input.prompt && !(input.attachments || []).length) throw Object.assign(new Error('请输入首条消息'), { status: 400 });
+    function refuse(reason: string | undefined, notSent = true): never { throw Object.assign(new Error(reason), { status: 409, notSent }); }
+    if (!input.prompt && !(input.attachments || []).length) throw Object.assign(new Error('请输入首条消息'), { status: 400, notSent: true });
     const state = await this.ui.check();
     if (!state.available) refuse(state.reason);
     await this.start();
@@ -577,8 +676,12 @@ class CodexBridge extends EventEmitter {
         return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
       };
       const cwd = normCwd(input.cwd);
-      const match = (await this.listProjects()).find(item => item.cwd && normCwd(item.cwd) === cwd);
+      const projects = await this.listProjects();
+      const match = projects.find(item => item.cwd && normCwd(item.cwd) === cwd);
       if (!match) refuse('这个文件夹不是 Codex 桌面版里的项目，请在桌面版里先把它加为项目');
+      if (projects.some(item => item.name === match.name && item.cwd && normCwd(item.cwd) !== cwd)) {
+        refuse('桌面版项目名称重复，请先区分项目名称 · ' + input.cwd);
+      }
       project = match.name;
     }
     let wanted: DesktopFlags;
@@ -588,8 +691,8 @@ class CodexBridge extends EventEmitter {
     const known = new Set(list(get(await this.send('thread/list', { limit: 50 }), 'result', 'data')).map(thread => get(thread, 'id')));
     // With a full-screen program in front, the request waits a while for it to go (throughFullscreen).
     const result = await throughFullscreen(() => this.ui.run(['new', project], { input: message, settings: wanted }), this.held());
-    if (!result.ok) refuse(result.error || '没能在 Codex 桌面版里新建聊天');
-    const thread = await this.newDesktopThread(known, message);
+    if (!result.ok) refuse(result.error || '没能在 Codex 桌面版里新建聊天', !!result.code && result.code !== 'crashed' && result['unanswered'] !== true);
+    const thread = await this.newDesktopThread(known, message, 25000, input.nativeCreationMarker ? { marker: input.nativeCreationMarker, cwd: input.cwd || '' } : undefined);
     if (!thread) throw Object.assign(new Error('消息已在 Codex 桌面版里发出，但还没在它的聊天列表里看到这个新聊天，请到桌面版里查看'), { status: 504 });
     const id = text(get(thread, 'id'));
     const emitter = new CodexRun();
@@ -598,13 +701,22 @@ class CodexBridge extends EventEmitter {
     return { id, cwd: text(get(thread, 'cwd') || input.cwd || ''), started: true };
   }
   // The chat the desktop just made: a thread that was not listed before, opened with this message.
-  async newDesktopThread(known: ReadonlySet<unknown>, message: string, timeoutMs = 25000): Promise<unknown> {
+  async newDesktopThread(known: ReadonlySet<unknown>, message: string, timeoutMs = 25000, required?: { marker: string; cwd: string }): Promise<unknown> {
     const until = Date.now() + timeoutMs;
     while (Date.now() < until) {
       const rows = list(get(await this.send('thread/list', { limit: 50 }).catch(() => null), 'result', 'data'));
       const fresh = rows.filter(thread => !known.has(get(thread, 'id')) && !get(thread, 'parentThreadId'));
-      const hit = fresh.find(thread => promptStarts(text(get(thread, 'preview')), message, 60)) || (fresh.length === 1 ? fresh[0] : null);
-      if (hit) return hit;
+      if (required) {
+        const matches = fresh.filter(thread => {
+          const cwd = text(get(thread, 'cwd'));
+          const resolve = (folder: string) => process.platform === 'win32' ? path.resolve(folder).toLowerCase() : path.resolve(folder);
+          return (!required.cwd || (!!cwd && resolve(cwd) === resolve(required.cwd))) && promptStarts(text(get(thread, 'preview')), required.marker);
+        });
+        if (matches.length === 1) return matches[0];
+      } else {
+        const hit = fresh.find(thread => promptStarts(text(get(thread, 'preview')), message, 60)) || (fresh.length === 1 ? fresh[0] : null);
+        if (hit) return hit;
+      }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     return null;
@@ -726,7 +838,7 @@ class CodexBridge extends EventEmitter {
     const seen = new Map<string, string>(), started = Date.now();
     let polling = false, warned = false;
     const writing = this.followReplies(emitter, id => seen.has(id));
-    const asks = this.watchAsks(threadId, emitter, writing.update);
+    const asks = this.watchAsks(threadId, emitter, () => emitter.turnId, writing.update);
     const stop = () => { clearInterval(timer); asks.close(); writing.close(); };
     const timer = setInterval(async () => {
       if (polling) return;
@@ -746,8 +858,10 @@ class CodexBridge extends EventEmitter {
           return;
         }
         const turnId = text(get(turn, 'id'));
+        if (emitter.turnId !== turnId) writing.update(this.live.get(threadId)?.liveTurns || []);
         emitter.turnId = turnId; emitter.queuedId = null;
-        for (const raw of list(get(turn, 'items'))) {
+        asks.sync();
+        for (const raw of planItemsOf(turn, this.live.get(threadId)?.turns.get(turnId))) {
           const item = itemOf(raw);
           if (!item) continue;
           const serialized = JSON.stringify(raw);
@@ -785,38 +899,130 @@ class CodexBridge extends EventEmitter {
       close() { closed = true; if (timer) clearTimeout(timer); timer = null; },
     };
   }
-  // The desktop's requests to the person while this turn runs, as cards; one answered (here or in
-  // the desktop) leaves the desktop's state, and its card goes. `onTurns` is given the owner's turns.
-  watchAsks(threadId: string, emitter: EngineEmitter, onTurns?: (turns: unknown[]) => void): { close(): void } {
-    const open = new Set<string>();
-    const watcher = this.desktop.watch?.(threadId, ({ requests, turns }) => {
-      onTurns?.(turns);
-      const now = new Set<string>();
-      for (const request of requests) {
-        const card = askCard(threadId, request);
-        if (!card) continue;
-        now.add(card.id);
-        if (!open.has(card.id)) { open.add(card.id); this.asks.set(card.id, { threadId, request }); emitter.emit('approval', card); }
-      }
-      for (const id of open) if (!now.has(id)) { open.delete(id); this.asks.delete(id); emitter.emit('approval_resolved', { id }); }
-    });
-    return { close: () => { watcher?.close(); for (const id of open) this.asks.delete(id); } };
+  // A browser and a console-originated run may both follow the same native chat.
+  watchSession(threadId: string, changed: () => void, onTurns?: (turns: unknown[]) => void): () => void {
+    let live = this.live.get(threadId);
+    if (!live) {
+      const entry: LiveThread = { listeners: new Set(), liveTurns: [], replyListeners: new Set(), asks: new Map(), turns: new Map(), owner: null, answering: new Set() };
+      this.live.set(threadId, entry);
+      let signature = '';
+      entry.watcher = this.desktop.watch?.(threadId, ({ requests, turns, owner }) => {
+        if (this.live.get(threadId) !== entry) return;
+        entry.owner = owner;
+        entry.liveTurns = turns;
+        for (const listener of entry.replyListeners) listener(turns);
+        const plans = codexDesktop.plansOf(turns);
+        const next = JSON.stringify([requests, plans, owner]);
+        if (signature === next) return;
+        signature = next;
+        // A lost subscription is not evidence that the desktop cleared a request.
+        if (owner === null) {
+          for (const listener of entry.listeners) listener();
+          return;
+        }
+        const current = new Map<string, Ask>();
+        for (const request of requests) {
+          const card = askCard(threadId, request);
+          if (card) current.set(card.id, { card, request });
+        }
+        entry.asks = current;
+        entry.turns = new Map(plans.map(turn => [turn.id, turn]));
+        for (const listener of entry.listeners) listener();
+      }, this.config.codexHome ? { sock: codexDesktop.socketPath(this.config.codexHome) } : undefined);
+      live = entry;
+    }
+    const entry = live;
+    entry.listeners.add(changed);
+    if (onTurns) { entry.replyListeners.add(onTurns); onTurns(entry.liveTurns); }
+    return () => {
+      if (onTurns) entry.replyListeners.delete(onTurns);
+      if (!entry.listeners.delete(changed) || entry.listeners.size || this.live.get(threadId) !== entry) return;
+      this.live.delete(threadId);
+      entry.watcher?.close();
+    };
   }
-  // Answered through the window that owns the thread, as its own card would be. Skipping a
-  // question answers it with nothing, as the desktop does when a turn is stopped.
-  async decide(id: string, decision: string): Promise<void> {
-    const ask = this.asks.get(id);
-    if (!ask) throw Object.assign(new Error('这个问题已经回答过了'), { status: 409 });
-    const { threadId, request } = ask;
-    try {
-      if (request.method === 'item/tool/requestUserInput') {
-        const question = list(get(request.params, 'questions'))[0], option = decision === 'decline' ? null : String(decision).replace(/^option:/, '');
-        await this.desktop.answerUserInput({ threadId, requestId: request.id, response: { answers: option && question ? { [String(get(question, 'id'))]: { answers: [option] } } : {} } });
-      } else {
-        await this.desktop.decideApproval({ threadId, requestId: request.id, kind: request.method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution', decision: decision === 'accept' ? 'accept' : 'decline' });
+
+  // A console run shows only the requests for the native turn that took its message.
+  watchAsks(threadId: string, emitter: EngineEmitter, turnId?: () => string | null | undefined, onTurns?: (turns: unknown[]) => void): { close(): void; sync(): void } {
+    let open = new Map<string, string>();
+    const sync = () => {
+      const activeId = turnId?.();
+      const now = new Map<string, string>();
+      for (const { card, request } of this.live.get(threadId)?.asks.values() || []) {
+        if (turnId && (!activeId || get(request.params, 'turnId') !== activeId)) continue;
+        const signature = JSON.stringify(card);
+        now.set(card.id, signature);
+        if (open.get(card.id) !== signature) emitter.emit('approval', card);
       }
-    } catch (err) { throw Object.assign(new Error(`没能在 Codex 桌面版里回答（${messageOf(err)}），请到桌面版里操作`), { status: 409 }); }
-    this.asks.delete(id);
+      for (const id of open.keys()) if (!now.has(id)) emitter.emit('approval_resolved', { id });
+      open = now;
+    };
+    const close = this.watchSession(threadId, sync, onTurns);
+    sync();
+    return { close, sync };
+  }
+
+  private waitForRequestRemoval(live: LiveThread, id: string): Promise<boolean> {
+    if (live.owner !== null && !live.asks.has(id)) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = (confirmed: boolean) => {
+        clearTimeout(timer);
+        live.listeners.delete(changed);
+        resolve(confirmed);
+      };
+      const changed = () => { if (live.owner !== null && !live.asks.has(id)) finish(true); };
+      const timer = setTimeout(() => finish(false), this.approvalConfirmMs);
+      live.listeners.add(changed);
+    });
+  }
+
+  approvalConfirmMs = 4000;
+
+  // Answers use the request scoped to the chat whose desktop window is holding it.
+  async decide(threadId: string, id: string, decision: unknown): Promise<void> {
+    const live = this.live.get(threadId), ask = live?.asks.get(id);
+    if (!live || !ask || live.answering.has(id)) throw Object.assign(new Error('这个问题已经回答过了'), { status: 409 });
+    if (live.owner === null) throw Object.assign(new Error('正在重新连接 Codex 桌面会话，请稍后再试'), { status: 409 });
+    const { request, card } = ask;
+    if (decision === 'desktop' || (!card.questions && !card.decisions.some(item => (typeof item === 'string' ? item : item.id) === decision))) {
+      throw Object.assign(new Error('这个选项已失效'), { status: 409 });
+    }
+    const answers: Array<[string, { answers: string[] }]> = [];
+    if (request.method === 'item/tool/requestUserInput' && decision !== 'decline') {
+      if (card.questions) {
+        const values = bag(get(decision, 'answers'));
+        const submitted = Object.entries(values || {});
+        for (const [key, value] of submitted) {
+          const question = card.questions.find(question => question.id === key), answer = str(value)?.trim();
+          if (!question || !answer || (!question.freeform && !question.options.some(option => option.label === answer))) {
+            throw Object.assign(new Error('这个选项已失效'), { status: 409 });
+          }
+          answers.push([key, { answers: [answer] }]);
+        }
+        if (!answers.length) throw Object.assign(new Error('请填写至少一项回答'), { status: 400 });
+      } else {
+        const questionId = String(get(request.params, 'questions', 0, 'id'));
+        answers.push([questionId, { answers: [String(decision).slice('option:'.length)] }]);
+      }
+    }
+    const options = { ...(this.config.codexHome ? { sock: codexDesktop.socketPath(this.config.codexHome) } : {}), targetClientId: live.owner };
+    const release = this.watchSession(threadId, () => {});
+    live.answering.add(id);
+    try {
+      try {
+        if (request.method === 'item/tool/requestUserInput') {
+          await this.desktop.answerUserInput({ threadId, requestId: request.id, response: { answers: Object.fromEntries(answers) } }, options);
+        } else {
+          await this.desktop.decideApproval({ threadId, requestId: request.id, kind: request.method === 'item/fileChange/requestApproval' ? 'fileChange' : 'commandExecution', decision: decision === 'accept' ? 'accept' : 'decline' }, options);
+        }
+      } catch (err) { throw Object.assign(new Error(`没能在 Codex 桌面版里回答（${messageOf(err)}），请到桌面版里操作`), { status: 409 }); }
+      if (!await this.waitForRequestRemoval(live, id)) {
+        throw Object.assign(new Error('Codex 桌面版尚未确认这个回答，请到原会话核对'), { status: 504 });
+      }
+    } finally {
+      live.answering.delete(id);
+      release();
+    }
   }
 
   // A message for the running turn goes to the desktop window that owns the thread, as its own

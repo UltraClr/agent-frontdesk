@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent Frontdesk bridge",
+    "description": "Loopback tunnel that lets Agent Frontdesk drive this Harness Host as its owner: read sessions, send, steer, stop, change settings, and answer cards, all executed by this Host.",
+    "detail": "docs/DETAIL.md"
+  }
+}

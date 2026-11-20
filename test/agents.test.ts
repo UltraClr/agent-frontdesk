@@ -135,6 +135,12 @@ test('PUT /api/agents/:id switches an agent on and off for every page, and keeps
   assert.deepEqual(Object.keys(must((await call('/api/status')).data as Record<string, unknown>)).sort(), ['first', 'second']);
   await hears('event: engines');
   assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { agents: { second: true } });
+  const readAt = Date.now() - 1000;
+  assert.deepEqual(await call('/api/sessions/first/chat/read', 'PUT', { at: readAt }), { status: 200, data: { at: readAt } });
+  assert.equal((await call('/api/sessions/first/chat/read', 'PUT', { at: readAt + 120_000 })).status, 400);
+  assert.deepEqual(await call('/api/sessions/first/chat/read', 'PUT', { at: readAt - 1000 }), { status: 200, data: { at: readAt } });
+  assert.deepEqual((await call('/api/read-markers')).data, { '["first","chat"]': readAt });
+  assert.deepEqual(new SettingsStore(settingsFile).readMarkers(), { '["first","chat"]': readAt });
   // Off while the console follows a turn of it and holds a message for it: held back, with the counts.
   assert.equal((await call('/api/sessions/first/chat/messages', 'POST', { prompt: 'work' })).status, 202);
   assert.equal((await call('/api/sessions/first/chat/messages', 'POST', { prompt: 'later', mode: 'queue' })).status, 202);
@@ -151,7 +157,7 @@ test('PUT /api/agents/:id switches an agent on and off for every page, and keeps
   assert.equal((await call('/api/sessions/first/chat')).status, 404);
   assert.equal((await fetch(`${base}/api/sessions/first/chat/events`)).status, 404, 'a page that reconnects is told the engine is gone');
   assert.deepEqual((dig((await call('/api/activity')).data, 'sessions') as Array<{ engine: string }>).filter(item => item.engine === 'first'), []);
-  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { agents: { second: true, first: false } });
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { agents: { second: true, first: false }, read: { '["first","chat"]': readAt } });
   // Bad requests.
   assert.equal((await call('/api/agents/nobody', 'PUT', { enabled: true })).status, 404);
   assert.equal((await call('/api/agents/first', 'PUT', { enabled: 'yes' })).status, 400);
@@ -176,11 +182,11 @@ test('a plugin that fails when switched on answers with its reason and stays off
   assert.equal(fs.existsSync(settingsFile), false, 'a choice that did not take is not kept');
 });
 
-test('the three built-in plugins say who they are without being set up', async () => {
+test('the built-in plugins say who they are without being set up', async () => {
   const host = new PluginHost({ config: { ...loadConfig(), claudeAppAsar: '/nowhere/Claude.app/Contents/Resources/app.asar', claudeDesktopHome: '/nowhere/claude', chatgptAppAsar: os.tmpdir() } });
   await host.discover(loadConfig().pluginDir);
   const catalog = await host.catalog();
-  assert.deepEqual(catalog.map(item => item.id), ['codex', 'claude', 'antigravity'], 'in the rail\'s order');
+  assert.deepEqual(catalog.map(item => item.id), ['codex', 'claude', 'antigravity', 'dsh', 'workbuddy'], 'in the rail\'s order');
   assert.equal(host.engines.size, 0, 'none was set up');
   for (const item of catalog) { assert.ok(item.label && item.accent, item.id); assert.equal(typeof item.installed, 'boolean', item.id); }
   // Found or not by what is on the machine: a path that is there, a path that is not.

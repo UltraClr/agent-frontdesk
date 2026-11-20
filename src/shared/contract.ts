@@ -133,7 +133,12 @@ export interface LatestTurn { id: string; status: TurnStatus | string; completed
 /** Where a session sits in one mode: its project there (null: none) and its rank. */
 export interface SpacePlacement { group?: SessionGroup | null; rank?: number }
 
+export type WaitingFor = 'approval' | 'input' | 'plan';
+
 export interface SessionMetadata {
+  waitingFor?: WaitingFor;
+  /** Position in the desktop’s pinned chats, starting at zero. */
+  pinnedRank?: number;
   group?: SessionGroup | null;
   parentId?: string;
   attention?: string;
@@ -204,6 +209,8 @@ export interface UnifiedTurn {
   timestamp: TimeValue;
   status: TurnStatus | string;
   statusEvidence: string | null;
+  /** User-visible failure reason from the desktop's record. */
+  error?: string;
   completedAt: TimeValue | null;
   messages: UnifiedMessage[];
   timeline: TimelineEntry[];
@@ -218,6 +225,15 @@ export interface UnifiedTurn {
 
 export interface History { session: UnifiedSession | null; turns: UnifiedTurn[] }
 
+export interface WeixinView {
+  state: 'disconnected' | 'pairing' | 'scanned' | 'verify' | 'connecting' | 'connected' | 'reconnecting' | 'expired' | 'unavailable';
+  engine?: string;
+  sessionId?: string;
+  qr?: string;
+  note?: string;
+  deliveryUncertain?: boolean;
+}
+
 export interface Model {
   id: string;
   name: string;
@@ -230,7 +246,69 @@ export interface Model {
 /** `stale`: the controls of the desktop app that its accessibility profile no longer finds by their marks (DesktopAutomation#staleControls): sending still works where their names do. */
 /** `park` (Windows): the engine's last park of its window, while recent, when it did not put everything back (DesktopAutomation#parkTrouble). */
 export interface EngineStatus { connected: boolean; error?: string; stale?: string[]; park?: { command: string; issues: string[]; at: number }; [extra: string]: unknown }
-export interface Project { id: string; name: string; cwd: string; space?: string }
+export interface Project { pinned?: boolean; id: string; name: string; cwd: string; space?: string }
+
+export interface SessionCandidate {
+  id: string;
+  title: string;
+  cwd: string;
+  project?: string;
+  updatedAt: TimeValue;
+}
+
+export interface CoordinatorAdapter {
+  /** Root configured by the plugin. Frontdesk owns only its dedicated project subdirectory. */
+  root?: string;
+  /** Native creation needs this folder registered as a desktop project. */
+  groupProject?: boolean;
+  /** Native creation path for a dedicated group member. An omitted root uses the app's standalone chat. */
+  groupMember?: {
+    root?: string;
+    catalog?(cwd: string): Awaitable<SessionCandidate[]>;
+    /** A desktop that creates an empty chat applies an explicit model before its first group turn. */
+    prepareModel?(id: string, model: string): Awaitable<void>;
+  };
+  /** Opens the workspace with a setup draft when the desktop cannot expose an empty session ID. */
+  prepare?(cwd: string, prompt: string): Awaitable<void>;
+  /** Selects the native default when the desktop requires an explicit model on creation. */
+  defaultModel?(): Awaitable<string>;
+  /** Desktop catalog metadata only. A cwd restricts recovery to one project. */
+  catalog(cwd?: string): Awaitable<SessionCandidate[]>;
+  /** Reads a known native coding session, including on recovery by its saved ID. */
+  read(id: string): Awaitable<History>;
+  /** Native setting the send channel needs repeated for an existing session. */
+  modelForSend?(session: UnifiedSession): string | undefined;
+}
+
+export interface CoordinatorTaskSummary {
+  prompt?: string;
+  reply?: string;
+  error?: string;
+  outcome?: 'completed' | 'failed' | 'interrupted';
+  followUp?: boolean;
+  sourceTurn?: string;
+  nativeTurn?: string;
+  id: string;
+  engine: string;
+  target: string;
+  title?: string;
+  role?: string;
+  purpose?: string;
+  updatedAt?: number;
+  state: string;
+}
+
+export interface CoordinatorView {
+  engine: string;
+  cwd: string;
+  sessionId: string | null;
+  desktopSetup: boolean;
+  pending: boolean;
+  canReset: boolean;
+  recovering: boolean;
+  candidates: SessionCandidate[];
+  tasks: CoordinatorTaskSummary[];
+}
 
 export interface UsageWindow { id: string; label?: string; windowMinutes?: number | null; remainingPercent?: number | null; usedPercent?: number | null; resetsAt?: number | null }
 export interface Usage { available: boolean; windows?: UsageWindow[]; short?: string; reason?: string; plan?: string | null; [extra: string]: unknown }
@@ -252,6 +330,8 @@ export interface SendInput {
   attachments: Attachment[];
 }
 export interface CreateInput extends Partial<SendInput> {
+  /** Internal correlate for a new native chat that must be matched without guessing. */
+  nativeCreationMarker?: string;
   /**
    * What the console showed as chosen on the desktop's new-chat page when the first message was
    * written (capabilities.newOptions). The engine checks the page still shows it, and picks it
@@ -308,7 +388,7 @@ export type EngineDelta =
   | { type: 'command_output'; id?: string; itemId?: string; output?: string }
   | { type: 'reasoning'; id?: string; itemId?: string }
   | { type: 'file_patch'; id?: string; itemId?: string };
-export interface ApprovalRequest { id: string; title?: string; detail?: string; decisions?: Array<string | { id: string; label: string }> }
+export type ApprovalRequest = Pick<Approval, 'id'> & Partial<Omit<Approval, 'id'>>;
 export interface EngineWarning { message?: string; retrying?: boolean; awaitingEnd?: boolean }
 export interface EngineCompleted { reply?: string; code?: number; turn?: { status?: string; error?: { message?: string } } }
 
@@ -356,6 +436,10 @@ export interface EngineMethods {
   steer?(id: string, input: SendInput, emitter?: EngineEmitter | null): Awaitable<{ shown?: boolean } | void | unknown>;
   sendNow?(id: string): Awaitable<{ status: string }>;
   decide?(approvalId: string, decision: string): Awaitable<unknown>;
+  /** Live state for this open desktop chat, merged by the adapter into read(). */
+  watchSession?(id: string, changed: () => void): () => void;
+  /** Validate and answer a live request in this desktop chat, including desktop-started turns. */
+  decideNative?(sessionId: string, approvalId: string, decision: unknown): Awaitable<unknown>;
   observe?(id: string, input?: CreateInput | SendInput): EngineEmitter;
   usage?(): Awaitable<Usage>;
   dictate?(options: DictationHandlers): Awaitable<DictationStream>;
@@ -399,6 +483,7 @@ export interface EngineDeclaration {
   look?: Look;
   spaces?: Space[];
   capabilities: Capabilities;
+  coordinator?: CoordinatorAdapter;
   /** Page modules the page imports, each exporting setup({ registerRenderer, engine, helpers }). */
   uiModules?: string[];
 }
@@ -427,6 +512,12 @@ export interface BridgeConfig {
   dictationEngine: string;
   /** Where the console keeps what the person chose for it (which agents are switched on). */
   settingsFile: string;
+  coordinatorProfile?: string;
+  workbuddyHome?: string;
+  dshHome?: string;
+  dshBridgeFile?: string;
+  dshAppIcon?: string;
+  dshAppAsar?: string;
   agyHome: string;
   agentapiBin: string | null;
   /** Arguments put before every agentapi command (Windows runs it as `language_server.exe agentapi …`). */
@@ -550,7 +641,20 @@ export interface PresentedArtifact { id: string; kind: string; title: string; pa
 // A card asking the person for something. The decision 'desktop' is no answer: its button takes
 // the person to the chat in the desktop app (capabilities.showInDesktop), for what can only be
 // done there (a dialog the desktop shows, a form of questions).
-export interface Approval { id: string; title: string; detail: string; decisions: Array<string | { id: string; label: string }> }
+export interface ApprovalQuestion {
+  id: string;
+  prompt: string;
+  options: Array<{ label: string; description: string }>;
+  freeform: boolean;
+}
+export interface Approval {
+  id: string;
+  title: string;
+  detail: string;
+  decisions: Array<string | { id: string; label: string }>;
+  kind?: 'input' | 'plan';
+  questions?: ApprovalQuestion[];
+}
 export interface PresentedMessage { id: string; text: string; phase?: string; status?: 'streaming' | 'completed'; at?: TimeValue }
 
 export interface PresentedTurn {
@@ -562,6 +666,7 @@ export interface PresentedTurn {
   workedMs: number;
   status: TurnStatus | string;
   statusEvidence: string | null;
+  error?: string;
   completedAt: string | null;
   timeline: TimelineEntry[];
   messages: PresentedMessage[];
@@ -621,7 +726,7 @@ export interface BridgeEventMap {
   // (`nativeTurnId`: the desktop's own turn this one was, where the engine named it: the page then
   // shows the turn once, however the desktop's record of it is dated.)
   'run.completed': { nativeTurnId?: string };
-  'run.failed': { message?: string; nativeTurnId?: string };
+  'run.failed': { message?: string; nativeTurnId?: string; notSent?: boolean };
   'run.interrupted': { nativeTurnId?: string };
   'session.snapshot': { session?: UnifiedSession | null; turns: PresentedTurn[]; [extra: string]: unknown };
   'queue.updated': { items: QueuedMessage[] };
@@ -640,6 +745,7 @@ export type AnyBridgeEvent = BridgeEventOf<BridgeEventType>;
 
 /** The dock's activity stream (GET /api/activity, /api/activity/events). */
 export interface ActivityEntry {
+  waitingFor?: WaitingFor;
   engine: EngineId;
   sessionId: string;
   turnId?: string | null;

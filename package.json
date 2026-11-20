@@ -52,7 +52,8 @@
     "lucide": "0.468.0",
     "marked": "15.0.12",
     "mermaid": "^11.17.2",
-    "multer": "^2.5.0"
+    "multer": "^2.5.0",
+    "qrcode": "1.5.4"
   },
   "engines": {
     "node": ">=22.16"
@@ -62,6 +63,7 @@
     "@types/express": "^5.0.6",
     "@types/multer": "^2.3.0",
     "@types/node": "^26.6.6",
+    "@types/qrcode": "1.5.6",
     "concurrently": "^10.0.7",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",

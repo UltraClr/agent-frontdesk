@@ -13,6 +13,8 @@ export interface NoticeSource { id?: string; text?: unknown; preview?: unknown; 
 class ActivityFeed {
   host: PluginHost; hub: EventHub; runs: RunService; intervalMs: number;
   entries: Map<string, ActivityEntry>; notices: ActivityNotice[]; knownMessages: Map<string, Set<string>>; nativeRunning: Set<string>;
+  private waitingWatches = new Map<string, () => void>();
+  private readonly baselines = new Map<string, number>();
   bus: EventEmitter; polling: boolean; timer: ReturnType<typeof setInterval> | null; clients: number; unsubscribe: () => void;
   constructor(host: PluginHost, hub: EventHub, runs: RunService, { intervalMs = 3000 }: { intervalMs?: number } = {}) {
     this.host = host; this.hub = hub; this.runs = runs; this.intervalMs = intervalMs;
@@ -32,9 +34,9 @@ class ActivityFeed {
     const preview = String(message.preview || message.text || '').replace(/\s+/g, ' ').trim().slice(0, 200);
     if (!preview) return false;
     const entry: ActivityEntry = this.entries.get(key) || { engine, sessionId, running: false, completedAt: 0 };
-    entry.lastMessageAt = Date.now(); this.entries.set(key, entry);
     // When the message was said, not when it was first seen here: a late sighting stays old.
     const said = stamp(message.at || message.timestamp || 0), at = said > 0 && said <= Date.now() ? said : Date.now();
+    entry.lastMessageAt = Math.max(entry.lastMessageAt || 0, at); this.entries.set(key, entry);
     this.notices.push({ id: `${key}:${message.id}`, messageId: message.id, engine, sessionId, preview, phase: String(message.phase || 'assistant'), at });
     this.notices.sort((a, b) => a.at - b.at);
     // Kept per engine: a talkative engine does not push out the last thing a quiet one said.
@@ -46,10 +48,12 @@ class ActivityFeed {
     if (event.type === 'assistant.notice' || (event.type === 'message.updated' && get(event.data, 'status') === 'completed')) {
       // Both carry a message: { id, text | preview, phase, at }.
       const data = event.data;
-      const said: NoticeSource = { id: String(get(data, 'id') ?? ''), text: get(data, 'text'), preview: get(data, 'preview'), phase: get(data, 'phase'), at: get(data, 'at') };
+      const said: NoticeSource = { id: String(get(data, 'id') ?? ''), text: get(data, 'text'), preview: get(data, 'preview'), phase: get(data, 'phase'),
+        at: get(data, 'at'), timestamp: event.timestamp };
       if (this.notice(event.engine, event.sessionId, said)) this.changed();
       return;
     }
+    if (event.type === 'approval.requested' || event.type === 'approval.resolved') { this.changed(); return; }
     const ended = ['run.completed', 'run.failed', 'run.interrupted'].includes(event.type);
     if (event.type !== 'run.started' && !ended && event.type !== 'run.connection_lost') return;
     const key = this.hub.key(event.engine, event.sessionId), previous: Partial<ActivityEntry> = this.entries.get(key) || {};
@@ -57,7 +61,7 @@ class ActivityFeed {
     if (ended && previous.turnId === event.turnId && previous.confirmedTerminal) return;
     // A console run that lost track of its turn is not shown as working on its word alone:
     // from then on the desktop's own record says whether the chat runs (poll).
-    this.entries.set(key, { ...previous, engine: event.engine, sessionId: event.sessionId, turnId: event.turnId,
+    this.entries.set(key, { ...previous, waitingFor: undefined, engine: event.engine, sessionId: event.sessionId, turnId: event.turnId,
       running: event.type === 'run.started' || (event.type === 'run.connection_lost' && this.nativeRunning.has(key)), outcome: ended ? event.type.slice(4) : null,
       startedAt: event.type === 'run.started' ? Date.parse(event.timestamp) || Date.now() : previous.startedAt || 0,
       confirmedTerminal: ended, completedAt: ended ? Date.parse(event.timestamp) : previous.completedAt || 0,
@@ -66,16 +70,30 @@ class ActivityFeed {
   }
   /** An engine has left the console: what it was doing and what it said leave the feed with it. */
   forget(engine: string): void {
+    this.baselines.delete(engine);
+    for (const [key, stop] of this.waitingWatches) if (this.hub.owns(engine, key)) { stop(); this.waitingWatches.delete(key); }
     for (const store of [this.entries, this.knownMessages]) for (const key of [...store.keys()]) if (this.hub.owns(engine, key)) store.delete(key);
     for (const key of [...this.nativeRunning]) if (this.hub.owns(engine, key)) this.nativeRunning.delete(key);
     this.notices = this.notices.filter(item => item.engine !== engine);
     this.changed();
   }
-  snapshot(): ActivitySnapshot { return { sessions: [...this.entries.values()], notices: this.notices, timestamp: Date.now() }; }
+  snapshot(): ActivitySnapshot {
+    const sessions = [...this.entries.values()].map(entry => {
+      const run = this.runs.get(entry.engine, entry.sessionId)?.run;
+      if (!run || run.status === 'reconnecting') return entry;
+      const request = run.approvals?.[0];
+      return { ...entry, waitingFor: request ? request.kind || 'approval' as const : entry.waitingFor };
+    });
+    return { sessions, notices: this.notices, timestamp: Date.now() };
+  }
+  private stopWatches() {
+    for (const stop of this.waitingWatches.values()) stop();
+    this.waitingWatches.clear();
+  }
   changed(): void {
     for (const [key, entry] of this.entries) {
       if (this.entries.size <= 512) break;
-      if (!entry.running) { this.entries.delete(key); this.knownMessages.delete(key); }
+      if (!entry.running && !entry.waitingFor) { this.entries.delete(key); this.knownMessages.delete(key); }
     }
     this.bus.emit('change', this.snapshot());
   }
@@ -84,37 +102,62 @@ class ActivityFeed {
     this.polling = true;
     try {
       const results = await Promise.allSettled([...this.host.engines.values()].map(async engine => {
+        const observedAt = Date.now();
         const list = await engine.list(); let changed = false;
         // The engine left while its list was being read (its agent was switched off): nothing is written.
         if (this.host.engines.get(engine.id) !== engine) return false;
+        const baseline = this.baselines.get(engine.id) ?? observedAt;
+        this.baselines.set(engine.id, baseline);
+        const wanted = new Set<string>(), listed = new Set<string>();
         for (const session of Array.isArray(list) ? list : []) {
           const key = this.hub.key(engine.id, session.id), previous = this.entries.get(key);
+          listed.add(key);
           const latest = session.metadata?.latestTurn;
           const confirmed = !!(latest && terminal.has(latest.status) && latest.completedAt != null && latest.statusEvidence);
           const token = confirmed && latest ? `${latest.id}:${latest.status}:${latest.completedAt}` : null;
-          const initial = !previous;
           const activeRun = this.runs.get(engine.id, session.id);
           const running = latest?.status === 'running' || ['busy', 'running', 'inProgress'].includes(String(session.status));
+          const waitingFor = session.metadata?.waitingFor;
+          // Follow the desktop’s live requests without loading background chat transcripts.
+          if (engine.watchSession && this.clients && (running || waitingFor || stamp(latest?.completedAt) > Date.now() - 60_000)) {
+            wanted.add(key);
+            if (!this.waitingWatches.has(key)) this.waitingWatches.set(key, engine.watchSession(session.id, () => {}));
+          }
           if (running) this.nativeRunning.add(key); else this.nativeRunning.delete(key);
           // What the turn in progress said is shown even when the chat is first seen mid-turn
           // (a chat started in the desktop, or one already working when the console opened).
           const since = activeRun ? stamp(activeRun.run.timestamp) : running ? stamp(session.metadata?.turnStartedAt || 0) : 0;
           for (const message of session.metadata?.recentMessages || []) {
-            const currentSpeech = since > 0 && stamp(message.at) >= since;
-            changed = this.notice(engine.id, session.id, message, previous?.nativeRevision == null && !currentSpeech) || changed;
+            const said = stamp(message.at);
+            const currentSpeech = since > 0 && said >= since;
+            const historical = said ? said <= baseline : previous?.nativeRevision == null;
+            changed = this.notice(engine.id, session.id, message, historical && !currentSpeech) || changed;
           }
-          if (activeRun && activeRun.run.status !== 'reconnecting') continue;
+          if (activeRun && activeRun.run.status !== 'reconnecting') {
+            if (previous && (previous.waitingFor !== waitingFor || previous.title !== session.title)) {
+              this.entries.set(key, { ...previous, waitingFor, title: session.title }); changed = true;
+            }
+            continue;
+          }
           const revision = String(session.updatedAt || '');
           // Idle/mtime and a finished shell command are not proof that the task ended.
-          const finished = !initial && !running && confirmed && token !== previous.nativeTerminalToken && stamp(latest?.completedAt) > (previous.completedAt || 0);
+          const endedAt = stamp(latest?.completedAt);
+          const finished = !running && confirmed && token !== previous?.nativeTerminalToken
+            && endedAt >= baseline && endedAt > (previous?.completedAt || 0);
           const outcome = finished ? latest?.status ?? null : running ? null : previous?.outcome || null;
           // A run seen here first starts when its turn did, so older speech is not shown as its.
           const startedAt = !running ? previous?.startedAt || 0 : (previous?.running && previous.startedAt) || stamp(session.metadata?.turnStartedAt || 0) || Date.now();
-          const next: ActivityEntry = { ...previous, engine: engine.id, sessionId: session.id, title: session.title, running, startedAt,
+          const next: ActivityEntry = { ...previous, engine: engine.id, sessionId: session.id, title: session.title, running, startedAt, waitingFor,
             nativeRevision: revision, nativeTerminalToken: token || previous?.nativeTerminalToken || null,
             outcome, confirmedTerminal: finished || previous?.confirmedTerminal || false,
-            completedAt: finished ? stamp(latest?.completedAt) : previous?.completedAt || 0 };
+            completedAt: finished ? endedAt : previous?.completedAt || 0 };
           if (JSON.stringify(next) !== JSON.stringify(previous)) { this.entries.set(key, next); changed = true; }
+        }
+        for (const [key, stop] of this.waitingWatches) if (this.hub.owns(engine.id, key) && !wanted.has(key)) {
+          stop(); this.waitingWatches.delete(key);
+        }
+        for (const [key, entry] of this.entries) if (entry.engine === engine.id && entry.waitingFor && !listed.has(key)) {
+          delete entry.waitingFor; changed = true;
         }
         return changed;
       }));
@@ -125,8 +168,8 @@ class ActivityFeed {
     this.clients++; this.bus.on('change', listener);
     if (!this.timer) { this.poll(); this.timer = setInterval(() => this.poll(), this.intervalMs); this.timer.unref?.(); }
     listener(this.snapshot());
-    return () => { this.bus.off('change', listener); if (--this.clients === 0) { if (this.timer) clearInterval(this.timer); this.timer = null; } };
+    return () => { this.bus.off('change', listener); if (--this.clients === 0) { if (this.timer) clearInterval(this.timer); this.timer = null; this.stopWatches(); } };
   }
-  dispose(): void { this.unsubscribe(); if (this.timer) clearInterval(this.timer); this.bus.removeAllListeners(); }
+  dispose(): void { this.clients = 0; this.stopWatches(); this.unsubscribe(); if (this.timer) clearInterval(this.timer); this.bus.removeAllListeners(); }
 }
 export { ActivityFeed };

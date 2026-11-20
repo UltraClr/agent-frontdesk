@@ -47,7 +47,7 @@ Agent Frontdesk puts those desktop apps into one web page. The apps still do the
 ## Features
 
 - All your AIs sit in a rail on the left. You can see who is running, who has a new reply and how much quota is left, and each one's latest line pops up next to its avatar
-- The sidebar has each AI's projects and chats, grouped the way its desktop app groups them, with search and a list of recent chats
+- Each AI’s sidebar shows up to three recent unread chats, then desktop pins, projects, and recent chats. Use **All chats** below the search box to change views. The browser remembers the view for each AI. Click the **!** badge or select **Needs your input** in the sidebar to see chats awaiting a decision. Reading a chat keeps it on the list until the request clears.
 - Continue any chat, or start a new one in a project
 - Send, steer a running turn, queue, stop. Switching to another AI while one is running does not interrupt it
 - Change the model, reasoning effort and permissions, attach images and files, dictate
@@ -90,6 +90,32 @@ On macOS, Frontdesk presses buttons in a desktop app's window without that windo
 - Codex's regular messages, steers, stops and most model changes use its own channel and aren't affected. A new Codex chat, and a model change for a chat Codex has not opened yet, go through its window like Claude's.
 
 If you know a way to act on a Chromium/Electron window on Windows without it taking the focus, please get in touch. What we've tried and measured is in [docs/windows.md](docs/windows.md).
+
+### Coordinator
+
+DeepSeek Harness can join the agent rail and receive work from a coordinator through its local desktop plugin. [DSH setup and supported actions](docs/skins/dsh/progress.md)
+
+Click the robot at the top of the rail to open your last-used coordinator chat. Choose Codex or Antigravity as the coordinator. Each keeps a separate project under `agent-frontdesk/<engine>-controller/` in its data directory. For Codex, open the setup draft, confirm the folder in the desktop app if prompted, and send the draft there once. After Frontdesk verifies the native chat and its folder, you can send tasks in the browser.
+
+The agent icons below open their regular chats. Ask the coordinator to find an existing Codex, Antigravity, or Claude coding chat, check its progress, or send it a message. Delegated tasks are tracked in the sidebar. Frontdesk can follow them with the browser closed while its server is running.
+
+Run `BRIDGE_COORDINATOR_PROFILE=preview PORT=4190 npm start` for a separate preview. Its coordinator projects live under `agent-frontdesk/profiles/preview/` and have their own chat bindings, connections, and tasks.
+
+Click **Remember chats** and describe a project, topic, or task. The coordinator can save any matching chat with a short description and an optional alias. Delegating work also remembers the target chat. Later you can say “Have the chat that collected the interviews add yesterday’s notes.” The coordinator checks its saved chats and asks you to choose if several fit. Each coordinator keeps its own list across restarts. Its local tool supports `track`, `workers`, and `untrack`. Expand a dispatch receipt to see the instruction, the target’s reply, or a delivery error. Once the desktop confirms delivery, **Open target chat** takes you to that turn. When you ask the coordinator to act on a reply, the tool uses `send` with `followUp: true` to start a follow-up turn. Receipts without a known source turn appear in the dispatch history at the bottom of the conversation.
+
+#### Groups
+
+Create a group from the coordinator sidebar or ask your coordinator to group the chats it found. Choose an agent to start a host chat or select an existing chat as the host. For a new Codex host, open the desktop setup draft when prompted. If host setup fails, you can select another host in the same group. Coordinators share the group directory.
+
+Use **Manage members** to add existing chats, set up dedicated members, or remove members after creating the group. Choose a member as the recipient to ask it directly. Choose the host for a multi-step discussion or summary. A decision links back to its native turn and can be reported explicitly to the current coordinator.
+
+The host continues in its own desktop chat. Ask it to consider member replies when needed, or use **Reply to this** to include a specific excerpt. Members receive their assigned question and relevant excerpts. If the same native chat participates in two groups, it remembers the tasks it received from both.
+
+#### Message the coordinator from WeChat
+
+On the Mac running Frontdesk, open an initialized coordinator chat and choose **WeChat** at the bottom of its sidebar. Generate a QR code, scan it with your own WeChat account, and enter the verification code if WeChat shows one. Private text messages go to the bound desktop chat. Its replies, delegated results, and requests for attention come back to the same WeChat conversation. You can close the browser while Frontdesk and the desktop engines stay running on the Mac.
+
+Each Frontdesk configuration binds one WeChat direct chat to one coordinator. Switching coordinators in the browser keeps the existing binding. The channel accepts private text from the paired account. Approvals and decisions to implement a plan use the desktop workflow. To stop forwarding, open **WeChat** and choose **Disconnect WeChat**. Credentials and delivery state are stored locally under `~/.config/agent-frontdesk/weixin/`. The connection uses [Tencent iLink](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol.md) long polling.
 
 ## Add an AI
 
@@ -134,7 +160,7 @@ All optional. Frontdesk finds standard install locations by itself.
 | `BRIDGE_PLUGIN_DIR` | Folder the plugins are loaded from | `dist/server/plugins` |
 | `BRIDGE_MODEL_CATALOG` | JSON file of model IDs for AIs that cannot list their own | none |
 | `BRIDGE_DICTATION_ENGINE` | Which AI's speech-to-text voice input tries first; it falls back to another AI's or the browser's | `claude` |
-| `CODEX_BIN` / `CODEX_HOME` | Codex executable and data folder | found on `PATH`, ChatGPT.app / MSIX package / `~/.codex` |
+| `CODEX_BIN` / `CODEX_HOME` | Codex executable and data folder | CLI bundled with the desktop app, then `PATH`. Data defaults to `~/.codex`. |
 | `CLAUDE_BIN` / `CLAUDE_HOME` | Claude Code executable and session folder | found on `PATH` or in Claude's app data / `~/.claude` |
 | `CLAUDE_DESKTOP_HOME` | Claude desktop app's data folder | `~/Library/Application Support/Claude` (Windows: `%LOCALAPPDATA%\Claude-Data\claude_<id>`, else `%APPDATA%\Claude`) |
 | `AGENTAPI_BIN` / `ANTIGRAVITY_HOME` | Antigravity's CLI and data folder | `~/.gemini/antigravity` |

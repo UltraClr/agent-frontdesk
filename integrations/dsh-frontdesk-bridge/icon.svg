@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Original stand-in mark for the Agent Frontdesk bridge: two connected windows. -->
+  <rect x="4" y="14" width="26" height="36" rx="5" fill="#0F1115" stroke="#4D6BFE" stroke-width="3"/>
+  <rect x="34" y="14" width="26" height="36" rx="5" fill="#0F1115" stroke="#8B5CF6" stroke-width="3"/>
+  <path d="M30 32h4" stroke="#E8ECFF" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="13" cy="24" r="2.6" fill="#4D6BFE"/>
+  <circle cx="51" cy="24" r="2.6" fill="#8B5CF6"/>
+  <path d="M10 40h14M40 40h14" stroke="#6B7A99" stroke-width="3" stroke-linecap="round"/>
+</svg>

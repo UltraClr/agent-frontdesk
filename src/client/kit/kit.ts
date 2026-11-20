@@ -255,12 +255,30 @@ function turnChanges(activities: Activity[]): Change[] {
 const decisions: Record<string, string> = { accept: t('允许'), decline: t('拒绝'), cancel: t('取消'), desktop: t('回到桌面端') };
 // A choice is a known decision ('accept') or the desktop's own option ({ id, label }).
 const choiceOf = (decision: Approval['decisions'][number]): { id: string; label: string } => typeof decision === 'string' ? { id: decision, label: decisions[decision] || decision } : { id: String(decision?.id ?? ''), label: say(String(decision?.label ?? '')) };
-const approval = (item: Approval) => `<div class="approval"><h3>${escape(say(item.title))}</h3>${item.detail ? `<p>${escape(say(item.detail))}</p>` : ''}<div class="approval-actions">${item.decisions.map(choiceOf).map((choice, index) => `<button class="${choice.id === 'accept' || choice.id === 'desktop' || (!index && typeof item.decisions[0] !== 'string') ? 'primary-button' : 'secondary-button'}" data-approval="${escape(item.id)}" data-decision="${escape(choice.id)}">${escape(choice.label)}</button>`).join('')}</div></div>`;
+function approval(item: Approval): string {
+  const heading = `<h3>${escape(say(item.title))}</h3>${item.detail ? `<p>${escape(say(item.detail))}</p>` : ''}`;
+  if (item.questions?.length) return `<form class="approval kit-question-form" data-approval-form="${escape(item.id)}">${heading}
+    ${item.questions.map((question, index) => `<fieldset data-question="${escape(question.id)}">
+      <legend>${escape(question.prompt)}</legend>
+      ${question.options.map(option => `<label class="kit-question-option">
+        <input type="radio" name="option${index}" value="${escape(option.label)}">
+        <span>${escape(option.label)}${option.description ? `<small>${escape(option.description)}</small>` : ''}</span>
+      </label>`).join('')}
+      ${question.freeform ? `<textarea rows="2" name="text${index}" aria-label="${escape(question.prompt)}" placeholder="${escape(t('输入你的回答'))}"></textarea>` : ''}
+    </fieldset>`).join('')}
+    <div class="approval-actions"><button class="primary-button" type="submit">${escape(t('提交回答'))}</button><button class="secondary-button" type="submit" value="decline">${escape(t('跳过'))}</button></div>
+  </form>`;
+  const buttons = item.decisions.map(choiceOf).map((choice, index) => `<button class="${choice.id === 'accept' || choice.id === 'desktop' || (!index && typeof item.decisions[0] !== 'string') ? 'primary-button' : 'secondary-button'}" data-approval="${escape(item.id)}" data-decision="${escape(choice.id)}">${escape(choice.label)}</button>`);
+  return `<div class="approval">${heading}<div class="approval-actions">${buttons.join('')}</div></div>`;
+}
 
 function renderKitTurn(turn: PageTurn, context: Partial<TurnContext> = {}): string {
   lookOf(context.provider);
   const style = look(), worksAbove = style.worked === 'fold';
-  const text = (value: string) => markdown(value);
+  const messageContent = (message: PageTurn['messages'][number]) => {
+    const content = markdown(message.text);
+    return `<div class="kit-text assistant-message${message.phase === 'plan' ? ' kit-proposed-plan' : ''}" data-message="${escape(message.id)}">${content}</div>`;
+  };
   const messages = turn.messages || [];
   const activities = (turn.activities || []).filter(item => item.kind !== 'reasoning');
   const byId = new Map(activities.map(item => [item.id, item]));
@@ -268,7 +286,7 @@ function renderKitTurn(turn: PageTurn, context: Partial<TurnContext> = {}): stri
   const plans = activities.filter(item => item.plan?.length), latestPlan = plans.at(-1);
   const parts: string[] = [], seen = new Set<string>(), wrapUps: Activity[] = [];
   // The answer that closes the turn: everything before it is the turn's work.
-  const answer = active ? null : messages.filter(item => item.phase === 'final_answer' && item.text).at(-1) || null;
+  const answer = active ? null : messages.findLast(item => ['final_answer', 'plan'].includes(item.phase || '') && item.text) || null;
   let answerAt = -1, foldFrom = 0;
   let group: Activity[] = [];
   // A preview's card sits above the run of tools that started it, which still lists it ("started preview").
@@ -280,7 +298,7 @@ function renderKitTurn(turn: PageTurn, context: Partial<TurnContext> = {}): stri
       if (!message?.text) continue;
       flush(); seen.add(message.id);
       if (message === answer) answerAt = parts.length;
-      parts.push(`<div class="kit-text assistant-message" data-message="${escape(message.id)}">${text(message.text)}</div>`);
+      parts.push(messageContent(message));
     } else if (entry.kind === 'activity') {
       const item = byId.get(entry.id);
       if (!item || item.plan?.length) continue; // The latest plan is drawn once, below.
@@ -301,7 +319,7 @@ function renderKitTurn(turn: PageTurn, context: Partial<TurnContext> = {}): stri
     }
   }
   flush();
-  for (const message of messages) if (message.text && !seen.has(message.id)) { if (message === answer) answerAt = parts.length; parts.push(`<div class="kit-text assistant-message" data-message="${escape(message.id)}">${text(message.text)}</div>`); }
+  for (const message of messages) if (message.text && !seen.has(message.id)) { if (message === answer) answerAt = parts.length; parts.push(messageContent(message)); }
   // Codex and Antigravity fold the work above the answer under "Worked for …"; while the turn
   // runs Codex heads it with "Working for …", and a stopped turn ends with "You stopped after …".
   if (worksAbove) {
@@ -317,7 +335,7 @@ function renderKitTurn(turn: PageTurn, context: Partial<TurnContext> = {}): stri
   const changes = style.diffCard && !active ? turnChanges(activities) : [];
   const changed = new Set(changes.map(item => normPath(item.path)).filter(Boolean));
   const artifacts = (turn.artifacts || []).filter(item => { const p = normPath(item.path); return !p || !changed.has(p); });
-  const thinking = active && !activities.some(item => item.status === 'running');
+  const thinking = active && !turn.approvals?.length && !activities.some(item => item.status === 'running');
   // renderers.ts registers 'artifact' itself, so the fallback is always there.
   const artifact: Renderers['artifact'] = item => (renderers.get(`artifact:${item.kind}`) || renderers.get('artifact') || (() => ''))(item);
   const confirmed = !!turn.statusEvidence || turn.source === 'console';

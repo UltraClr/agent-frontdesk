@@ -78,12 +78,22 @@
     "newChat": [
       {
         "role": "AXButton",
-        "class": "sidebar-item",
+        "class": ["sidebar-item", "group"],
+        "inside": "sidebarHeader"
+      },
+      {
+        "role": "AXButton",
+        "name": "新聊天",
         "inside": "sidebarHeader"
       },
       {
         "role": "AXButton",
         "name": "New chat",
+        "inside": "sidebarHeader"
+      },
+      {
+        "role": "AXButton",
+        "class": "sidebar-item",
         "inside": "sidebarHeader"
       }
     ],
@@ -91,6 +101,10 @@
       {
         "role": "AXPopUpButton",
         "prefix": "Change project"
+      },
+      {
+        "role": "AXPopUpButton",
+        "prefix": "切换项目："
       },
       {
         "role": "AXPopUpButton",
@@ -104,7 +118,18 @@
       },
       {
         "role": "AXButton",
-        "contains": "work in a project"
+        "contains": "work in a project",
+        "inside": "projectSlot"
+      }
+    ],
+    "projectlessOption": [
+      {
+        "roles": ["AXButton", "AXMenuItem", "AXRow", "AXRadioButton"],
+        "name": "Don't work in a project"
+      },
+      {
+        "roles": ["AXButton", "AXMenuItem", "AXRow", "AXRadioButton"],
+        "name": "不在项目中工作"
       }
     ],
     "projectList": [
@@ -117,6 +142,10 @@
         "name": "Suggestions"
       }
     ],
+    "projectRow": {
+      "class": "comboboxRow-*",
+      "inside": "projectList"
+    },
     "permissionsMenu": [
       {
         "role": "AXPopUpButton",
@@ -139,13 +168,16 @@
         "index": 1
       }
     ],
-    "projectChooser": {
-      "roles": [
-        "AXPopUpButton",
-        "AXButton"
-      ],
-      "name": "Choose project"
-    },
+    "projectChooser": [
+      {
+        "roles": ["AXPopUpButton", "AXButton"],
+        "name": "Choose project"
+      },
+      {
+        "roles": ["AXPopUpButton", "AXButton"],
+        "name": "选择项目"
+      }
+    ],
     "modeSwitch": [
       {
         "role": "AXPopUpButton",

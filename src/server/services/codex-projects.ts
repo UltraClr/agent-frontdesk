@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { bag, get, list, parseJson } from '../../shared/guards.js';
 
-export interface CodexProject { id: string; name: string; roots: string[]; position: number; legacyId: string }
-interface DesktopProjects { assignments: Map<string, string>; projectless: Set<unknown>; order: unknown[]; legacy: Map<string, unknown> }
+export interface CodexProject { id: string; name: string; roots: string[]; position: number; legacyId: string; pinned?: boolean }
+interface DesktopProjects { pinnedThreads: Map<string, number>; pinnedProjects: unknown[]; assignments: Map<string, string>; projectless: Set<unknown>; order: unknown[]; legacy: Map<string, unknown> }
 
 // Which project a Codex thread belongs to, as the Codex desktop app shows it.
 // The project list comes from the app-server (project/list). Until the desktop app has moved
@@ -13,7 +13,7 @@ interface DesktopProjects { assignments: Map<string, string>; projectless: Set<u
 class CodexProjects {
   file: string; stamp: string; state: DesktopProjects;
   constructor({ codexHome }: { codexHome: string }) { this.file = path.join(codexHome, '.codex-global-state.json'); this.stamp = ''; this.state = this.empty(); }
-  empty(): DesktopProjects { return { assignments: new Map(), projectless: new Set(), order: [], legacy: new Map() }; }
+  empty(): DesktopProjects { return { pinnedThreads: new Map(), pinnedProjects: [], assignments: new Map(), projectless: new Set(), order: [], legacy: new Map() }; }
   desktop(): DesktopProjects {
     try {
       const stat = fs.statSync(this.file), stamp = `${stat.mtimeMs}:${stat.size}`;
@@ -24,6 +24,8 @@ class CodexProjects {
       for (const map of Object.values(bag(raw['app-server-project-id-by-legacy-project-id-by-host']) || {})) for (const [legacy, id] of Object.entries(bag(map) || {})) state.legacy.set(legacy, id);
       for (const [thread, entry] of Object.entries(bag(raw['thread-project-assignments']) || {})) { const projectId = get(entry, 'projectId'); if (projectId) state.assignments.set(thread, String(projectId)); }
       for (const thread of list(raw['projectless-thread-ids'])) state.projectless.add(thread);
+      list(raw['pinned-thread-ids']).forEach((id, index) => { if (typeof id === 'string') state.pinnedThreads.set(id, index); });
+      state.pinnedProjects = list(raw['pinned-project-ids']);
       state.order = list(raw['project-order']);
       this.stamp = stamp; this.state = state;
     } catch { /* No desktop app (CLI only), or the file is mid-write: keep what was read last. */ }
@@ -45,6 +47,10 @@ class CodexProjects {
     const legacy = new Map<string, unknown>(desktop.legacy);
     for (const project of projects) if (project.legacyId) legacy.set(project.legacyId, project.id);
     const current = (id: unknown): string => { const key = String(id); if (byId.has(key)) return key; const mapped = legacy.get(key); return typeof mapped === 'string' && byId.has(mapped) ? mapped : ''; };
+    for (const id of desktop.pinnedProjects) {
+      const project = byId.get(current(id));
+      if (project) project.pinned = true;
+    }
     // The desktop lists projects it has not ordered yet first (newest first), then its saved order.
     const rank = new Map(desktop.order.map(current).filter(Boolean).map((id, index) => [id, index]));
     const ordered = [...projects].sort((a, b) => (Number(rank.has(a.id)) - Number(rank.has(b.id))) || (rank.has(a.id) ? (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0) : desktop.order.length ? b.position - a.position : a.position - b.position));

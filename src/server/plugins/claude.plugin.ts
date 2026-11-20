@@ -97,7 +97,7 @@ export const setup: PluginSetup = ({ config = {}, registerEngine, registerAsset 
   const mode = new ChatMode({ automation: bridge.desktop, space: 'chat', label: 'Claude 桌面版', list: () => chatSessions().chats, idFrom: /\/chat\/([0-9a-f-]{36})/, waitSeconds: 0, pollMs: 3000, watchVisible: true });
   const isChat = (id: string | null) => mode.has(id);
   const asSession = (chat: ModeChat, projects: readonly ClaudeChatProject[]) => new UnifiedSession({ id: chat.id, engine: 'claude', title: chat.title, updatedAt: chat.updatedAt, sendBlocked: ELSEWHERE,
-    metadata: { space: 'chat', contentUnavailable: ELSEWHERE, group: chat.projectId ? { id: chat.projectId, name: text(projects.find(project => project.id === chat.projectId)?.name || chat['projectName'] || '') } : null } });
+    metadata: { space: 'chat', ...(chat['starred'] === true && { pinnedRank: 0 }), contentUnavailable: ELSEWHERE, group: chat.projectId ? { id: chat.projectId, name: text(projects.find(project => project.id === chat.projectId)?.name || chat['projectName'] || '') } : null } });
   // Not while it is answering, and only what the mode takes (no attachments, its own settings).
   const chatOnly = 'Claude 模式的聊天在回复时不能插话，消息已排队，等这条回复结束再发';
   let sprite: Clawd | null | undefined;
@@ -142,9 +142,11 @@ export const setup: PluginSetup = ({ config = {}, registerEngine, registerAsset 
       // Every message goes through the desktop's window, which on Windows takes the focus for a moment (uia-driver.cs).
       takesFocus: process.platform === 'win32' },
     status: () => bridge.getStatus(), models: () => bridge.getModels(), usage: () => bridge.getUsage(),
+    coordinator: { groupMember: config.claudeDesktopHome ? { root: config.claudeDesktopHome } : {},
+      catalog: () => bridge.coordinationCatalog(), read: id => bridge.read(id) },
     dictate: options => bridge.dictate(options), dictationReady: () => bridge.dictationReady(),
     list: async () => { const { projects } = chatSessions(); return [...await bridge.list(), ...mode.chats().map(chat => asSession(chat, projects))]; },
-    projects: () => chatSessions().projects.map(project => ({ id: project.id, name: project.name, cwd: '', space: 'chat' })),
+    projects: () => chatSessions().projects.map(project => ({ id: project.id, name: project.name, cwd: '', space: 'chat', ...(project.starred && { pinned: true }) })),
     // A Claude-mode chat: its messages read from the desktop's window.
     read: async id => {
       const chat = mode.get(id);

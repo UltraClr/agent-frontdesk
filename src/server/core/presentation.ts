@@ -125,6 +125,7 @@ function presentHistory<H extends { turns?: UnifiedTurn[]; session?: UnifiedSess
     // An agent that edits the same file several times names it once.
     artifacts: [...new Map((turn.artifacts || []).map(artifactOf).filter((item): item is PresentedArtifact => !!item).map(item => [item.path || item.url || item.id, item])).values()],
     ...(turn.approvals?.length ? { approvals: turn.approvals } : {}),
+    ...(turn.error ? { error: turn.error } : {}),
   })) };
 }
 
@@ -148,8 +149,9 @@ function bindEvents(emitter: EngineEmitter, emit: Emit): () => void {
   };
   const itemEvent = (data: unknown, status: unknown) => {
     const item = bag(get(data, 'item') || data) || {};
-    if (get(item, 'type') === 'agentMessage') {
-      message(String(get(item, 'id')), textOf(get(item, 'text') || get(item, 'content')), get(item, 'phase'), true, status === 'running' ? 'streaming' : 'completed');
+    if (get(item, 'type') === 'agentMessage' || get(item, 'type') === 'plan') {
+      const phase = get(item, 'type') === 'plan' ? 'plan' : get(item, 'phase');
+      message(String(get(item, 'id')), textOf(get(item, 'text') || get(item, 'content')), phase, true, status === 'running' ? 'streaming' : 'completed');
     } else if (!['userMessage', 'sleep'].includes(String(get(item, 'type')))) {
       const next = activityOf(item, status), previous = activities.get(String(get(item, 'id')));
       if (!next.output && previous?.output) next.output = previous.output;
@@ -191,7 +193,12 @@ function bindEvents(emitter: EngineEmitter, emit: Emit): () => void {
   // same thing its history lists): a file the agent merely read or edited is not one by itself.
   on('artifact', data => { const artifact = artifactOf(data); if (artifact) emit('artifact.upsert', artifact); });
   on('approval_resolved', data => emit('approval.resolved', { id: String(data.id) }));
-  on('approval', data => emit('approval.requested', { id: String(data.id), title: brief(data.title || '需要批准操作'), detail: clip(data.detail), decisions: (data.decisions || ['accept', 'decline']).slice(0, 12).map(item => typeof item === 'string' ? item : { id: String(get(item, 'id') ?? ''), label: brief(get(item, 'label')) }) }));
+  on('approval', data => emit('approval.requested', {
+    id: String(data.id), title: brief(data.title || '需要批准操作'), detail: clip(data.detail),
+    decisions: (data.decisions || ['accept', 'decline']).slice(0, 12).map(item => typeof item === 'string' ? item : { id: String(get(item, 'id') ?? ''), label: brief(get(item, 'label')) }),
+    ...(data.kind ? { kind: data.kind } : {}),
+    ...(data.questions?.length ? { questions: data.questions } : {}),
+  }));
   on('completed', data => {
     for (const value of [...messages.values()]) if (value.status !== 'completed') message(value.id, value.text, value.phase, true, 'completed');
     if (data?.reply && !messages.size && !['Finished turn', '已完成。'].includes(data.reply)) message('reply', data.reply, 'final_answer', true, 'completed');
@@ -203,7 +210,9 @@ function bindEvents(emitter: EngineEmitter, emit: Emit): () => void {
   on('warning', data => emit('run.warning', { message: data.message || '引擎正在重试', retrying: data.retrying !== false, awaitingEnd: !!data.awaitingEnd }));
   on('error', err => {
     const message = get(err, 'message') ? String(get(err, 'message')) : String(err);
-    if (get(err, 'transport') || get(err, 'terminal') === false) emit('run.connection_lost', { message }); else emit('run.failed', { message });
+    if (get(err, 'notSent') === true) emit('run.failed', { message, notSent: true });
+    else if (get(err, 'transport') || get(err, 'terminal') === false) emit('run.connection_lost', { message });
+    else emit('run.failed', { message });
   });
   return () => { for (const off of subscriptions) off(); };
 }

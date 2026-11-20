@@ -37,8 +37,8 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
   // Its sidebar's Recents list the Codex threads too, so a title they share is not driven (sharedTitle).
   const chats = new ChatMode({ automation: bridge.ui, space: 'chatgpt', label: 'Codex 桌面版', list: () => mode().conversations.filter(item => !item.local), sidebar: () => mode().conversations });
   const remote = (id: string) => chats.get(id);
-  const asSession = (item: { id: string; title: string; updatedAt: string }, rank: number) => new UnifiedSession({ id: item.id, engine: 'codex', title: item.title, updatedAt: item.updatedAt, sendBlocked: ELSEWHERE,
-    metadata: { space: 'chatgpt', contentUnavailable: ELSEWHERE, group: null, bySpace: { chatgpt: { rank } } } });
+  const asSession = (item: { id: string; title: string; updatedAt: string }, rank: number, pinnedRank?: number) => new UnifiedSession({ id: item.id, engine: 'codex', title: item.title, updatedAt: item.updatedAt, sendBlocked: ELSEWHERE,
+    metadata: { pinnedRank, space: 'chatgpt', contentUnavailable: ELSEWHERE, group: null, bySpace: { chatgpt: { rank } } } });
   // Codex threads in both modes: under their project in "Codex", in Recents (by recency) in "ChatGPT".
   // Both modes order them as the desktop's Recents does (its catalog's recency), not by the thread's
   // own update time, so the console's "最近" matches the desktop's.
@@ -54,7 +54,11 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
         ? { ...thread.metadata, space: ['codex', 'chatgpt'], bySpace: { chatgpt: { group: null, rank: rank.get(thread.id) }, codex } }
         : { ...thread.metadata, bySpace: { ...thread.metadata?.bySpace, codex } };
     }
-    return [...threads, ...chats.chats().map(item => asSession(item, rank.get(chats.realOf(item.id)) ?? -1))];
+    const pins = bridge.projectIndex.desktop().pinnedThreads;
+    return [...threads, ...chats.chats().map(item => {
+      const id = chats.realOf(item.id);
+      return asSession(item, rank.get(id) ?? -1, pins.get(id));
+    })];
   };
   registerEngine({
     ...IDENTITY, prefix: 'CX', character: () => (loadSprite() ? CHARACTER : null),
@@ -77,6 +81,17 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
     // code blocks have a header, a turn's edits end in a diff card, and no times are shown.
     look: { worked: 'fold', workingLive: true, toolCaption: 'kinds', diffCard: true, userTime: false, replyTime: 'none' },
     usage: () => bridge.getUsage(),
+    coordinator: { groupProject: true, groupMember: {}, ...(config.codexHome ? { root: config.codexHome } : {}), prepare: (cwd, prompt) => bridge.prepareCoordinator(cwd, prompt),
+      catalog: cwd => bridge.coordinationCatalog(cwd),
+      read: async id => {
+        try { return await bridge.getThread(id); }
+        catch (error) {
+          if (error instanceof Error && /^(thread not loaded|no rollout found for thread|thread not found)\b/i.test(error.message)) {
+            throw Object.assign(error, { status: 404 });
+          }
+          throw error;
+        }
+      } },
     status: () => bridge.getStatus(), models: () => bridge.getModels(),
     list: listAll,
     projects: async () => [...await bridge.listProjects(), ...mode().projects.map(project => ({ ...project, space: 'chatgpt' }))],
@@ -95,7 +110,8 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
     steer: (id, input) => { if (remote(id)) throw Object.assign(new Error('ChatGPT 对话在回复时不能插话，消息已排队，等这条回复结束再发'), { fallback: 'queue' }); return bridge.steerTurn(id, input); },
     // What the desktop waits on the person for (its question, a command, a file change) is a card
     // in the chat, answered through the window that owns the thread.
-    decide: (id, decision) => bridge.decide(id, decision),
+    watchSession: (id, changed) => remote(id) ? () => {} : bridge.watchSession(id, changed),
+    decideNative: (sessionId, id, decision) => bridge.decide(sessionId, id, decision),
   });
   return () => bridge.dispose();
 };

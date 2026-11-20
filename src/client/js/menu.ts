@@ -33,8 +33,8 @@ export function closeMenu(): void {
 
 // A popover list. items: [{ value, label, hint?, selected?, group? }].
 /** `at`: where the pointer was, for a menu opened by right-click (it opens there instead of under its anchor). */
-export interface MenuOptions<T extends MenuItem> { onPick?: (item: T) => void; onClose?: () => void; label?: string; at?: { x: number; y: number } }
-export function showMenu<T extends MenuItem>(anchor: HTMLElement, items: T[], { onPick, onClose, label = '', at }: MenuOptions<T> = {}): HTMLElement | undefined {
+export interface MenuOptions<T extends MenuItem> { onPick?: (item: T) => void; onClose?: () => void; icon?: (item: T) => HTMLElement; label?: string; at?: { x: number; y: number } }
+export function showMenu<T extends MenuItem>(anchor: HTMLElement, items: T[], { onPick, onClose, icon, label = '', at }: MenuOptions<T> = {}): HTMLElement | undefined {
   if (open.menu?.anchor === anchor) { closeMenu(); return; }
   closeMenu();
   const menu = document.createElement('div');
@@ -52,6 +52,11 @@ export function showMenu<T extends MenuItem>(anchor: HTMLElement, items: T[], { 
     option.innerHTML = '<span class="menu-check" aria-hidden="true"></span><span class="menu-label"></span>';
     const labelText = find(option, '.menu-label');
     if (labelText) labelText.textContent = item.label;
+    if (icon) {
+      const graphic = icon(item);
+      graphic.setAttribute('aria-hidden', 'true');
+      option.prepend(graphic);
+    }
     if (item.description) { option.classList.add('has-description'); const text = document.createElement('span'); text.className = 'menu-description'; text.textContent = item.description; labelText?.after(text); }
     if (item.hint) { const hint = document.createElement('span'); hint.className = 'menu-hint'; hint.textContent = item.hint; option.append(hint); }
     option.addEventListener('click', () => { closeMenu(); onPick?.(item); anchor.focus({ preventScroll: true }); });
@@ -79,13 +84,16 @@ document.addEventListener('keydown', event => {
   else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); options[event.key === 'Home' ? 0 : options.length - 1]?.focus(); }
   else if (event.key === 'Tab') closeMenu();
   else if (event.key.length === 1 && !event.metaKey && !event.ctrlKey) {
-    const starts = (option: HTMLElement) => (option.textContent || '').toLowerCase().startsWith(event.key.toLowerCase());
+    const starts = (option: HTMLElement) => (find(option, '.menu-label')?.textContent || '').toLowerCase().startsWith(event.key.toLowerCase());
     const match = options.find((option, index) => index > at && starts(option)) || options.find(starts);
     match?.focus();
   }
 }, true);
 addEventListener('resize', closeMenu);
-document.addEventListener('scroll', event => { if (open.menu && !open.menu.menu.contains(nodeOf(event.target))) closeMenu(); }, true);
+document.addEventListener('scroll', event => {
+  const scroller = nodeOf(event.target);
+  if (open.menu && scroller?.contains(open.menu.anchor)) closeMenu();
+}, true);
 
 // Replace a native select's look while keeping the element itself.
 export function enhanceSelect(select: HTMLSelectElement, { variant = 'subtle' } = {}): HTMLButtonElement | undefined {

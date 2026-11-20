@@ -35,14 +35,16 @@ const stamp = (value: TimeValue | null | undefined): number => typeof value === 
 /** A chat as the sidebar reads it: a session, or the part of one a test or a skin gives. */
 export type SideSession = Pick<UnifiedSession, 'id'> & Partial<Pick<UnifiedSession, 'title' | 'cwd' | 'updatedAt'>> & { metadata?: SessionMetadata | undefined };
 /** A project the engine lists (plugin.projects()). */
-export interface ListedProject { id: string; name?: string; cwd?: string; space?: string | string[] }
+export interface ListedProject { pinned?: boolean; id: string; name?: string; cwd?: string; space?: string | string[] }
 /** Anything placed in a mode: a session (metadata.space) or a listed project (space). */
 export interface SpaceItem { metadata?: SessionMetadata | undefined; space?: string | string[] | undefined }
 export interface SideEntry<S extends SideSession = SideSession> { session: S; children: S[] }
-export interface SideProject<S extends SideSession = SideSession> { id: string; name: string; cwd: string; items: Array<SideEntry<S>> }
+export interface SideProject<S extends SideSession = SideSession> { pinned?: boolean; id: string; name: string; cwd: string; items: Array<SideEntry<S>> }
 /** A row of "最近": a chat and the project it is in (null: none). */
 export interface RecentEntry<S extends SideSession = SideSession> extends SideEntry<S> { project: { id: string; name: string } | null }
 
+export const sidebarViews = { all: '全部会话', waiting: '待你处理', unread: '全部未读', pinned: '置顶', projects: '项目', recents: '最近' } as const;
+export type SidebarView = keyof typeof sidebarViews;
 export const PROJECT_ROWS = 5, CHAT_ROWS = 30;
 export const SIDEBAR_WIDTH = { min: 200, max: 520 };
 export const clampSidebarWidth = (width: number, viewport = Infinity): number => Math.round(Math.min(Math.max(SIDEBAR_WIDTH.min, width), Math.max(SIDEBAR_WIDTH.min, Math.min(SIDEBAR_WIDTH.max, viewport - 360))));
@@ -99,7 +101,7 @@ export function organize<S extends SideSession>(sessions: S[] = [], listed: Arra
   for (const item of sessions) { const parent = parentOf(item); if (!parent) continue; const kids = children.get(parent) || []; children.set(parent, kids); kids.push(item); }
   type Row = SideProject<S> & { listed: boolean };
   const projects = new Map<string, Row>(), chats: Array<SideEntry<S>> = [], recents: Array<RecentEntry<S>> = [];
-  for (const project of listed) if (project?.id) projects.set(String(project.id), { id: String(project.id), name: String(project.name || basename(project.cwd) || project.id), cwd: project.cwd || '', listed: true, items: [] });
+  for (const project of listed) if (project?.id) projects.set(String(project.id), { id: String(project.id), name: String(project.name || basename(project.cwd) || project.id), cwd: project.cwd || '', pinned: project.pinned, listed: true, items: [] });
   for (const session of sessions) {
     if (isChild(session)) continue;
     const entry = { session, children: children.get(session.id) || [] };
@@ -131,17 +133,25 @@ export class SidebarPrefs {
   open: Set<unknown>; width: number;
   more = new Set<string>(); // "show more" lasts for the visit only
   shown = new Map<string, number>(); // how far "聊天" has been scrolled, per engine (the visit only)
+  views: Record<string, unknown>;
   spaces: Record<string, unknown>; // the mode last shown, per engine
   constructor(storage?: StoreLike | null) {
     this.storage = storage;
     // What this page saved before; read field by field, as anything else may be there.
     let saved: unknown = {};
     try { saved = JSON.parse(storage?.getItem(this.key) || '{}') || {}; } catch {}
+    const views = get(saved, 'views');
+    this.views = isBag(views) ? { ...views } : {};
     const open = get(saved, 'open'), spaces = get(saved, 'spaces');
     this.open = new Set(Array.isArray(open) ? open : []);
     this.width = Number(get(saved, 'width')) || 0;
     this.spaces = spaces && isBag(spaces) ? { ...spaces } : {};
   }
+  view(engine: string): SidebarView {
+    const view = this.views[engine];
+    return typeof view === 'string' && Object.hasOwn(sidebarViews, view) ? view as SidebarView : 'all';
+  }
+  setView(engine: string, view: SidebarView): void { this.views[engine] = view; this.save(); }
   space(engine: string): string { const space = this.spaces[engine]; return space ? String(space) : ''; }
   setSpace(engine: string, space: string): void { if (this.spaces[engine] === space) return; this.spaces[engine] = space; this.save(); }
   id(engine: string, project: string): string { return `${engine}\n${project}`; }
@@ -150,7 +160,7 @@ export class SidebarPrefs {
   limit(id: string): number { return this.shown.get(id) || CHAT_ROWS; }
   grow(id: string): void { this.shown.set(id, this.limit(id) + CHAT_ROWS); }
   setWidth(width: number): void { this.width = width; this.save(); }
-  save(): void { try { this.storage?.setItem(this.key, JSON.stringify({ open: [...this.open], width: this.width, spaces: this.spaces })); } catch {} }
+  save(): void { try { this.storage?.setItem(this.key, JSON.stringify({ open: [...this.open], width: this.width, spaces: this.spaces, views: this.views })); } catch {} }
 }
 
 const FOLDER = '<svg class="side-folder is-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg><svg class="side-folder is-open" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>';
@@ -165,13 +175,15 @@ const PLUS = '<svg class="side-plus" viewBox="0 0 24 24" aria-hidden="true"><pat
 // on hover, like the desktop apps) that starts a new chat there; 'any': in every project (a mode
 // whose projects are not folders, as Claude's and ChatGPT's chat projects).
 // `space`: the mode shown (only for remembering how far its "最近" list has grown).
-export interface SidebarOptions<S extends SideSession> { projects?: ListedProject[]; engineId?: string; space?: string; currentId?: string; query?: string; status?: (session: S) => Partial<{ running: boolean; unread: boolean; draft: boolean }> | null | undefined; time?: (session: S) => string; prefs?: SidebarPrefs; newChat?: boolean | 'any' }
+export interface SidebarOptions<S extends SideSession> { projects?: ListedProject[]; engineId?: string; space?: string; currentId?: string; query?: string; status?: (session: S) => Partial<{ running: boolean; unread: boolean; unreadAt: number; draft: boolean; waitingFor: 'input' | 'plan' | 'approval' }> | null | undefined; time?: (session: S) => string; prefs?: SidebarPrefs; newChat?: boolean | 'any' }
 export function renderSidebar<S extends SideSession>(sessions: S[], { projects: listed = [], engineId = '', space = '', currentId = '', query = '', status = () => ({}), time = () => '', prefs = new SidebarPrefs(null), newChat = false }: SidebarOptions<S> = {}): string {
   const tree = organize(sessions, listed);
+  const view = prefs.view(engineId);
   const row = (session: S, child = false, project: RecentEntry['project'] = null) => {
     const flags = status(session) || {};
-    const unread = !flags.running && !!flags.unread;
-    const mark = flags.running ? ("<span class=\"side-dot is-running\" aria-label=\"" + t('正在运行') + "\"></span>")
+    const unread = !!flags.unread;
+    const wait = flags.waitingFor && { input: '等待回答', plan: '等待确认计划', approval: '等待审批' }[flags.waitingFor];
+    const mark = wait ? `<span class="side-wait">${t(wait)}</span>` : flags.running ? ("<span class=\"side-dot is-running\" aria-label=\"" + t('正在运行') + "\"></span>")
       : unread ? ("<span class=\"side-dot is-attention\" aria-label=\"" + t('需要查看') + "\"></span>")
       : `<time class="side-time">${escape(time(session))}</time>`;
     return `<button type="button" class="session-row side-row${child ? ' is-child' : ''}${flags.running ? ' is-running' : ''}${unread ? ' is-unread' : ''}" data-session="${escape(session.id)}" aria-current="${currentId === session.id}" title="${escape(session.title || '')}"><span class="session-name">${escape(session.title || t('未命名聊天'))}</span>${project ? `<span class="side-project-tag" title="${escape(project.name)}">${escape(project.name)}</span>` : ''}${flags.draft ? ("<span class=\"draft-label\">" + t('草稿') + "</span>") : ''}${mark}</button>`;
@@ -188,7 +200,7 @@ export function renderSidebar<S extends SideSession>(sessions: S[], { projects: 
   // It reaches down to the open chat only when that chat is in no project (one in a project is
   // in view under it already).
   const recents = (entries: Array<RecentEntry<S>>) => {
-    const id = prefs.id(engineId, space ? `\0${space}` : ''), limit = query ? entries.length : Math.max(prefs.limit(id), entries.findIndex(entry => !entry.project && holds(entry)) + 1);
+    const id = prefs.id(engineId, space ? `\0${space}` : ''), limit = query ? entries.length : Math.max(prefs.limit(id), entries.findIndex(entry => (view === 'recents' || !entry.project) && holds(entry)) + 1);
     return entries.slice(0, limit).map(entry => row(entry.session, false, entry.project) + entry.children.map(kid => row(kid, true)).join('')).join('') + (entries.length > limit ? `<div class="side-sentinel" data-side-sentinel="${escape(id)}" aria-hidden="true"></div>` : '');
   };
   const project = (item: SideProject<S>) => {
@@ -196,5 +208,39 @@ export function renderSidebar<S extends SideSession>(sessions: S[], { projects: 
     const plus = newChat && (item.cwd || newChat === 'any') ? `<button type="button" class="side-project-new" data-project-new="${escape(item.id)}" data-cwd="${escape(item.cwd)}" title="${escape(t('在「{name}」里新建聊天', { name: item.name }))}" aria-label="${escape(t('在「{name}」里新建聊天', { name: item.name }))}">${PLUS}</button>` : '';
     return `<section class="side-project${open ? ' is-open' : ''}${item.items.some(holds) ? ' has-current' : ''}${plus ? ' can-new' : ''}" data-project="${escape(item.id)}"><div class="side-project-bar"><button type="button" class="side-project-head" data-project-toggle="${escape(item.id)}" aria-expanded="${open}" title="${escape(item.cwd || item.name)}">${CHEVRON}${FOLDER}<span class="side-label">${escape(item.name)}</span></button>${plus}</div>${open ? `<div class="side-project-rows">${item.items.length ? rows(item.items, PROJECT_ROWS, prefs.id(engineId, item.id)) : ("<p class=\"side-empty-row\">" + t('还没有聊天') + "</p>")}</div>` : ''}</section>`;
   };
-  return `${tree.projects.length && !query ? `<div class="side-section" data-side-section="projects"><h2 class="side-heading">${t('项目')}</h2>${tree.projects.map(project).join('')}</div>` : ''}${tree.recents.length ? `<div class="side-section" data-side-section="recents"><h2 class="side-heading">${t('最近')}</h2>${recents(tree.recents)}</div>` : ''}`;
+  const section = (id: string, heading: string, body: string, action = '') =>
+    body ? `<section class="side-section" data-side-section="${id}"><h2 class="side-heading">${t(heading)}${action}</h2>${body}</section>` : '';
+  const empty = (label: string) => `<p class="quiet-state">${t(query ? '没有匹配的聊天' : label)}</p>`;
+  const all = view === 'all';
+  const overview = all && !query;
+  const flatRow = (item: S) => row(item, false, groupOf(item));
+  if (view === 'waiting') {
+    const waiting = sessions.filter(item => status(item)?.waitingFor);
+    return section('waiting', '待你处理', waiting.map(flatRow).join('')) || empty('暂无待处理会话');
+  }
+  let unread = '', pinned = '', projects = '', recent = '';
+  if (overview || view === 'unread') {
+    const news = sessions.flatMap(item => {
+      const flags = status(item);
+      return flags?.unread ? [{ item, at: flags.unreadAt ?? stamp(item.updatedAt) }] : [];
+    }).sort((a, b) => b.at - a.at);
+    const more = overview && news.length > 3 ? `<button type="button" class="side-view-more" data-view-unread>${t('查看全部')} (${news.length})</button>` : '';
+    unread = section('unread', overview ? '最近未读' : '全部未读', (overview ? news.slice(0, 3) : news).map(({ item }) => flatRow(item)).join(''), more);
+    if (view === 'unread') return unread || empty('没有未读会话');
+  }
+  const projectMatches = (item: SideProject<S>) => !query || item.items.length || item.name.toLocaleLowerCase().includes(query);
+  if (overview || view === 'pinned') {
+    const chats = sessions.filter(item => item.metadata?.pinnedRank != null)
+      .sort((a, b) => a.metadata!.pinnedRank! - b.metadata!.pinnedRank!);
+    const folders = tree.projects.filter(item => item.pinned && projectMatches(item));
+    pinned = section('pinned', '置顶', chats.map(flatRow).join('') + folders.map(project).join(''));
+    if (view === 'pinned') return pinned || empty('没有置顶项目或会话');
+  }
+  if (overview || view === 'projects') {
+    const folders = tree.projects.filter(item => (!overview || !item.pinned) && projectMatches(item));
+    projects = section('projects', '项目', folders.map(project).join(''));
+    if (view === 'projects') return projects || empty('没有项目');
+  }
+  if (tree.recents.length) recent = section('recents', '最近', recents(tree.recents));
+  return unread + pinned + projects + recent || empty('还没有聊天');
 }

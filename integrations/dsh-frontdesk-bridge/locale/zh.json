@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent Frontdesk 桥",
+    "description": "只监听本机回环地址的通道，让 Agent Frontdesk 以所有者身份驱动这个 Harness Host：读会话、发送、插话、停止、改设置、答卡片，全部由这个 Host 执行。",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { presentHistory, bindEvents, type Emit } from './presentation.js';
 import type { PluginHost } from './plugin-host.js';
 import type { EventHub } from './event-hub.js';
-import type { AgentBusy, Attachment, CreateInput, EngineEmitter, QueuedMessage, RunTurn, SendInput } from '../../shared/contract.js';
+import type { AgentBusy, Attachment, CreateInput, EngineEmitter, History, QueuedMessage, RunTurn, SendInput } from '../../shared/contract.js';
 import { get, messageOf } from '../../shared/guards.js';
 
 const terminal = new Set<string>(['run.completed', 'run.failed', 'run.interrupted']);
@@ -11,6 +11,8 @@ const isTerminal = (type: string): type is 'run.completed' | 'run.failed' | 'run
 /** A turn the console runs: the public turn, the engine's emitter, and the timers that watch it. */
 export interface RunRecord {
   run: RunTurn;
+  /** A bridge-owned request reference, used to route follow-ups back to that request. */
+  origin?: string;
   emitter: EngineEmitter | null;
   dispose: () => void;
   timer: ReturnType<typeof setTimeout> | null;
@@ -19,9 +21,15 @@ export interface RunRecord {
   emit: Emit;
 }
 interface QueueItem { id: string; input: SendInput; at: string }
+interface StartOptions { observe?: boolean; at?: string; origin?: string; onNotSent?: (message: string) => void }
 // What an engine threw on purpose: `fallback: 'queue'` sends a steer to the queue instead.
 const fallbackOf = (err: unknown) => get(err, 'fallback');
 const failure = (message: string, status: number) => Object.assign(new Error(message), { status });
+export function sessionBusy(history: History): boolean {
+  const status: unknown = history.session?.status;
+  const type = get(status, 'type') || status;
+  return type === 'busy' || type === 'running' || history.turns?.at(-1)?.status === 'running';
+}
 
 class RunService {
   host: PluginHost; hub: EventHub; active: Map<string, RunRecord>; timeoutMs: number;
@@ -32,11 +40,11 @@ class RunService {
     this.queues = new Map(); this.draining = new Map(); this.pollMs = 3000;
   }
   get(engine: string, id: string): RunRecord | undefined { return this.active.get(this.hub.key(engine, id)); }
-  start(engineId: string, id: string, input: SendInput | CreateInput, { observe = false, at }: { observe?: boolean; at?: string } = {}): { turnId: string; cursor: string } {
+  start(engineId: string, id: string, input: SendInput | CreateInput, { observe = false, at, origin, onNotSent }: StartOptions = {}): { turnId: string; cursor: string } {
     const engine = this.host.get(engineId), key = this.hub.key(engineId, id);
     if (this.active.has(key)) throw failure('当前会话已有任务正在执行', 409);
     const run: RunTurn = { id: randomUUID(), userPrompt: input.prompt, timestamp: at || new Date().toISOString(), status: 'running', messages: [], activities: [], artifacts: [], approvals: [], timeline: [] };
-    const record: RunRecord = { run, emitter: null, dispose: () => {}, timer: null, reconciler: null, reconciling: false, emit: () => {} };
+    const record: RunRecord = { run, origin, emitter: null, dispose: () => {}, timer: null, reconciler: null, reconciling: false, emit: () => {} };
     this.active.set(key, record); this.hub.pinned.add(key);
     const emit: Emit = (...event) => {
       if (this.active.get(key) !== record) return;
@@ -65,6 +73,7 @@ class RunService {
       // (a chat read from the desktop's page) can only be matched to it by that.
       if (isTerminal(event[0]) && run.nativeTurnId) this.hub.publish(engineId, id, run.id, event[0], { ...event[1], nativeTurnId: run.nativeTurnId });
       else this.hub.publish(engineId, id, run.id, ...event);
+      if (event[0] === 'run.failed' && event[1].notSent) onNotSent?.(event[1].message || '消息未发出');
     };
     record.emit = emit;
     emit('run.started', { turn: run });
@@ -76,7 +85,9 @@ class RunService {
           record.emitter = engine.observe(id, input);
         } else record.emitter = engine.send(id, sendInputOf(input));
         record.dispose = bindEvents(record.emitter, emit);
-      } catch (err) { emit('run.failed', { message: messageOf(err) }); }
+      } catch (err) {
+        emit('run.failed', { message: messageOf(err), ...(get(err, 'notSent') === true && { notSent: true }) });
+      }
     });
     record.timer = setTimeout(() => {
       emit('run.connection_lost', { message: '正在重新确认引擎状态，任务没有被判定失败' });
@@ -100,7 +111,7 @@ class RunService {
         for (const activity of presented.activities) record.emit('activity.upsert', activity);
         if (turn.completedAt != null) {
           if (turn.status === 'completed') record.emit('run.completed', {});
-          else if (turn.status === 'failed') record.emit('run.failed', {});
+          else if (turn.status === 'failed') record.emit('run.failed', { message: turn.error });
           else if (turn.status === 'interrupted') record.emit('run.interrupted', {});
         }
       } catch { /* Transport loss is unknown, not proof of task failure. */ }
@@ -177,9 +188,7 @@ class RunService {
         let busy = false;
         try {
           const history = await this.host.get(engineId).read(id);
-          const status: unknown = history?.session?.status;
-          const type = get(status, 'type') || status;
-          busy = type === 'busy' || type === 'running' || history?.turns?.at(-1)?.status === 'running';
+          busy = sessionBusy(history);
         } catch { busy = false; }
         if (this.active.has(key)) break;
         if (busy) { await new Promise<void>(resolve => { setTimeout(resolve, this.pollMs).unref?.(); }); continue; }
@@ -207,6 +216,7 @@ class RunService {
   }
   async decide(engineId: string, id: string, approvalId: string, decision: unknown): Promise<void> {
     const engine = this.host.get(engineId), record = this.get(engineId, id);
+    if (engine.decideNative) { await engine.decideNative(id, approvalId, decision); return; }
     const approval = record?.run.approvals.find(item => item.id === approvalId);
     if (!record || !approval || !approval.decisions.some(item => (typeof item === 'string' ? item : item.id) === decision) || !engine.decide) throw failure('审批不存在或已失效', 409);
     await engine.decide(approvalId, String(decision));

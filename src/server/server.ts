@@ -16,6 +16,10 @@ import { RunService } from './core/run-service.js';
 import { ActivityFeed } from './services/activity-feed.js';
 import { UsageService } from './services/usage-service.js';
 import { SessionObserver } from './services/session-observer.js';
+import { Groups } from './services/groups.js';
+import { Coordinator } from './services/coordinator.js';
+import { Weixin, weixinFile } from './services/weixin.js';
+import type { WeixinApi } from './services/weixin-api.js';
 import { DictationService } from './services/dictation.js';
 import { presentHistory } from './core/presentation.js';
 import { AttachmentStore, ATTACHMENTS_ONLY_PROMPT, isUploadError } from './core/attachments.js';
@@ -34,9 +38,9 @@ const engineOf = (req: Request): Engine => { if (!req.engine) throw Object.assig
 const statusOf = (err: unknown, fallback = 500): number => Number(errorField(err, 'status')) || fallback;
 /** A chat just created here, listed until its engine lists it. */
 type Draft = CreateResult & { engine: string; cwd: string; title: string; updatedAt: string };
-export interface AppOptions { config?: BridgeConfig; host?: PluginHost; hub?: EventHub }
+export interface AppOptions { config?: BridgeConfig; host?: PluginHost; hub?: EventHub; weixin?: { file: string; api: WeixinApi; interval?: number } }
 
-async function createApp({ config = loadConfig(), host: given, hub = new EventHub() }: AppOptions = {}) {
+async function createApp({ config = loadConfig(), host: given, hub = new EventHub(), weixin: channel }: AppOptions = {}) {
   const host = given || new PluginHost({ config });
   // Which agents are on: the person's choice (settings), else whether the agent's desktop app is
   // on this machine. A host handed in with its engines already registered keeps exactly those.
@@ -46,13 +50,15 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
   if (!host.engines.size && !host.plugins.size) await host.discover(config.pluginDir);
   await host.start(id => settings.agent(id));
   const runs = new RunService(host, hub);
+  const coordinator = new Coordinator(host, runs, { profile: config.coordinatorProfile });
+  const weixin = new Weixin(host, coordinator, runs, channel?.file || weixinFile(config.settingsFile, config.coordinatorProfile), channel?.api, channel?.interval);
   const drafts = new Map<string, Draft>();
   const activity = new ActivityFeed(host, hub, runs);
   const usage = new UsageService(host);
   const streams = new Set<Response>();
   // The pages following the overview (told when the agents change), and each engine's open chat streams.
   const overviews = new Set<Response>(), chatStreams = new Map<string, Set<Response>>();
-  const observer = new SessionObserver(host, hub, runs);
+  const observer = new SessionObserver(host, hub, runs, { read: (engine, id) => coordinator.readSession(engine, id) });
   const dictation = new DictationService(host, { preferred: config.dictationEngine });
   const app = express();
   app.disable('x-powered-by');
@@ -88,13 +94,13 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     if (method !== 'list') return engine[method]();
     // Without the recent replies each engine attaches for the activity feed (ActivityFeed asks the
     // engine itself): the page never reads them, and they were most of a list's bytes.
-    const result: Array<UnifiedSession | Draft> = (await engine.list()).map(session => {
+    const result: Array<UnifiedSession | Draft> = (await engine.list()).filter(session => !coordinator.isProject(engine, session.cwd)).map(session => {
       if (!session.metadata?.recentMessages) return session;
       const { recentMessages: _, ...metadata } = session.metadata;
       return { ...session, metadata };
     });
     const ids = new Set(result.map(item => item.id));
-    for (const draft of drafts.values()) if (draft.engine === engine.id && !ids.has(draft.id)) result.unshift(draft);
+    for (const draft of drafts.values()) if (draft.engine === engine.id && !ids.has(draft.id) && !coordinator.isProject(engine, draft.cwd)) result.unshift(draft);
     return result;
   };
   const collect = async (method: 'status' | 'models' | 'list', selected?: unknown) => Object.fromEntries(await Promise.all(
@@ -104,7 +110,9 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     })
   ));
   app.get('/api/usage', async (req, res) => res.json(await usage.all()));
+  app.get('/api/usage/:engineId', async (req, res) => res.json(await usage.read(host.get(req.params.engineId))));
   app.get('/api/activity', (req, res) => res.json(activity.snapshot()));
+  app.get('/api/read-markers', (_req, res) => res.set('Cache-Control', 'no-store').json(settings.readMarkers()));
   // The person typing in the page (desktop-automation.ts, markTyping). Only a page on this machine
   // counts: the foreground a Windows helper's action takes is this machine's.
   app.post('/api/typing', (req, res) => {
@@ -118,7 +126,9 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     res.flushHeaders(); streams.add(res);
     const unsubscribe = activity.subscribe(snapshot => { if (!res.destroyed && !res.writableEnded) {
       if (res.writableLength > 1024 * 1024) { res.end(); return; }
-      res.write(`event: activity\ndata: ${JSON.stringify(snapshot)}\n\n`);
+      const sessions = snapshot.sessions.filter(item => !coordinator.isSession(item.engine, item.sessionId));
+      const notices = snapshot.notices.filter(item => !coordinator.isSession(item.engine, item.sessionId));
+      res.write(`event: activity\ndata: ${JSON.stringify({ ...snapshot, sessions, notices })}\n\n`);
     } });
     const timer = setInterval(() => res.write(': heartbeat\n\n'), 15000); timer.unref?.();
     overviews.add(res);
@@ -191,7 +201,7 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
   // the sidebar, and where a new chat can start.
   app.get('/api/projects', async (req, res) => res.json(Object.fromEntries(await Promise.all(
     [...host.engines.values()].filter(engine => typeof engine.projects === 'function').map(async engine => {
-      try { return [engine.id, (await engine.projects?.() || []).filter(item => item?.id).slice(0, 500).map(item => ({ id: String(item.id), name: String(item.name || ''), cwd: String(item.cwd || ''), ...(item.space ? { space: String(item.space) } : {}) }))]; }
+      try { return [engine.id, (await engine.projects?.() || []).filter(item => item?.id && !coordinator.isProject(engine, item.cwd)).slice(0, 500).map(item => ({ id: String(item.id), name: String(item.name || ''), cwd: String(item.cwd || ''), ...(item.space ? { space: String(item.space) } : {}) }))]; }
       catch { return [engine.id, []]; }
     })
   ))));
@@ -212,6 +222,13 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
   // Engines may mirror a session they cannot safely write to (for example one that
   // is open in its desktop client); refuse before a run is created.
   const sendBlocked = async (engine: Engine, id: string | null): Promise<string> => engine.capabilities.sendBlocked || (await engine.blocked?.(id)) || '';
+  app.put('/api/sessions/:engine/:id/read', (req, res) => {
+    const at = get(req.body, 'at');
+    if (typeof at !== 'number' || !Number.isSafeInteger(at) || at <= 0 || at > Date.now() + 60_000) {
+      return res.status(400).json({ error: 'Invalid read timestamp' });
+    }
+    return res.json({ at: settings.markRead(engineOf(req).id, req.params.id, at) });
+  });
   // What an engine's desktop app asks for before a new chat's first message (optional per
   // engine): its controls, read live from the desktop, and one pick made there. A pick answers
   // with the controls as they are afterwards, since one pick can bring up the next.
@@ -271,7 +288,7 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     const { engine, id } = req.params, target = engineOf(req);
     // A draft stands in for the session until the engine can read it.
     let history: { session: (UnifiedSession | Draft) & { capabilities?: unknown; sendBlocked?: string; isDesktopActive?: boolean } | null | undefined; turns: ReturnType<typeof presentHistory>['turns'] };
-    try { const presented = presentHistory(await target.read(id)); history = presented; }
+    try { const presented = presentHistory(await coordinator.readSession(target.id, id)); history = presented; }
     catch (err) {
       const draft = drafts.get(hub.key(engine, id));
       if (!draft) throw err;
@@ -307,25 +324,95 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     // Files with nothing typed still make a message (a new chat's first one too).
     return { ...input, ...(expect.length ? { expect } : {}), prompt: input.prompt || (files.length ? ATTACHMENTS_ONLY_PROMPT : ''), attachments: files };
   };
-  app.post('/api/sessions/:engine', async (req, res) => {
-    const engine = engineOf(req), input = validateInput(req.body);
+  const createSession = async (engine: Engine, input: CreateInput, origin?: string) => {
     const blocked = await sendBlocked(engine, null);
-    if (blocked) return res.status(409).json({ error: blocked });
-    if (engine.capabilities.createRequiresPrompt && !input.prompt) return res.status(400).json({ error: '请输入首条消息' });
+    if (blocked) throw Object.assign(new Error(blocked), { status: 409, notSent: true });
+    if (engine.capabilities.createRequiresPrompt && !input.prompt) throw Object.assign(new Error('请输入首条消息'), { status: 400, notSent: true });
     // The desktop has the first message before create() answers: the turn is dated from here.
     const asked = new Date().toISOString();
     const session: CreateResult & { run?: unknown } = await engine.create(input);
     if (!session?.id) throw new Error('引擎未返回会话 ID');
-    drafts.set(hub.key(req.params.engine, session.id), { ...session, engine: req.params.engine, cwd: session.cwd || input.cwd || '', title: input.title || input.prompt || '新建聊天', updatedAt: new Date().toISOString() });
+    drafts.set(hub.key(engine.id, session.id), { ...session, engine: engine.id, cwd: session.cwd || input.cwd || '', title: input.title || input.prompt || '新建聊天', updatedAt: new Date().toISOString() });
     const oldest = drafts.keys().next().value;
     if (drafts.size > 128 && oldest !== undefined) drafts.delete(oldest);
-    if (session.started && engine.observe) session.run = runs.start(req.params.engine, session.id, input, { observe: true, at: asked });
-    res.json(session);
+    if (session.started && engine.observe) session.run = runs.start(engine.id, session.id, input, { observe: true, at: asked, origin });
+    return session;
+  };
+  const groups = new Groups(path.join(path.dirname(config.settingsFile), '.frontdesk-groups', config.coordinatorProfile || 'default', path.basename(config.settingsFile) + '.sqlite'),
+    config.coordinatorProfile || '', host, runs, createSession,
+    (binding, id, report) => { if (binding.origin) weixin.groupReport(binding.engine, binding.id, binding.origin, id, report); },
+    binding => coordinator.isSession(binding.engine, binding.id));
+  coordinator.groups = groups;
+  app.get('/api/groups', (req, res) => res.json(groups.search(req.query)));
+  app.get('/api/group-engines', (_req, res) => res.json(groups.engines()));
+  app.get('/api/group-member-options/:engine', async (req, res) => res.json(await groups.memberOptions(engineOf(req))));
+  app.get('/api/group-members', async (req, res) => res.json(await groups.members(String(req.query.engine || ''), String(req.query.q || ''))));
+  app.get('/api/group-members/:engine', async (req, res) => res.json(await groups.members(req.params.engine, String(req.query.q || ''))));
+  app.post('/api/groups/:engine/create', async (req, res) => res.status(202).json(await groups.create(engineOf(req), req.body)));
+  app.get('/api/groups/:group', (req, res) => res.json(groups.view(req.params.group, Number(req.query.before) || undefined)));
+  app.get('/api/groups/:group/decisions', (req, res) => res.json(groups.decisions(req.params.group, Number(req.query.before) || undefined)));
+  app.post('/api/groups/:group/prepare', async (req, res) => res.json(await groups.prepare(req.params.group)));
+  app.post('/api/groups/:group/retry', (req, res) => res.json(groups.retry(req.params.group)));
+  app.put('/api/groups/:group/host/:engine', async (req, res) => res.json(await groups.chooseHost(req.params.group, engineOf(req), req.body)));
+  app.post('/api/groups/:group/deliveries/:delivery/retry', (req, res) => res.json(groups.retryDelivery(req.params.group, req.params.delivery)));
+  app.patch('/api/groups/:group/members', async (req, res) => res.json(await groups.changeMembers(req.params.group, req.body)));
+  app.put('/api/groups/:group/members/:member/setup', async (req, res) => res.json(await groups.configureMember(req.params.group, req.params.member, req.body)));
+  app.post('/api/groups/:group/messages', (req, res) => res.status(202).json(groups.send(req.params.group, req.body)));
+  app.put('/api/groups/:group/name', (req, res) => res.json(groups.rename(req.params.group, req.body)));
+  app.put('/api/groups/:group/pin', (req, res) => res.json(groups.pin(req.params.group, get(req.body, 'pinned') === true)));
+  app.put('/api/groups/:group/pause', (req, res) => res.json(groups.pause(req.params.group, get(req.body, 'paused') === true)));
+  app.post('/api/groups/:group/report/:engine', (req, res) => {
+    const engine = engineOf(req), id = coordinator.boundId(engine);
+    if (!id) throw Object.assign(new Error('请先打开或恢复已有的总控会话'), { status: 409 });
+    res.json(groups.report(req.params.group, req.body, { engine: engine.id, id }));
+  });
+  app.post('/api/sessions/:engine', async (req, res) => {
+    res.json(await createSession(engineOf(req), validateInput(req.body)));
+  });
+  app.get('/api/coordinator', (_req, res) => res.json(coordinator.engines()));
+  const weixinUrl = '/api/coordinator/channels/weixin';
+  app.use(weixinUrl, (req, res, next) => {
+    // QR and binding controls are only served to a browser on this Mac.
+    const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+    res.set('Cache-Control', 'no-store');
+    if (!loopback.includes(req.socket.remoteAddress || '') || !['localhost', '127.0.0.1', '[::1]', '::1'].includes(req.hostname)) {
+      return res.status(403).json({ error: '请在运行 Frontdesk 的 Mac 上管理微信连接' });
+    }
+    next();
+  });
+  app.get(weixinUrl, (_req, res) => res.json(weixin.view()));
+  app.post(weixinUrl, (req, res) => {
+    const engine = str(get(req.body, 'engine')), sessionId = str(get(req.body, 'sessionId'));
+    if (!engine || !/^[a-z][a-z0-9-]*$/.test(engine) || !sessionId || !/^[\w-]{1,200}$/.test(sessionId) || !coordinator.isSession(engine, sessionId)) {
+      return res.status(409).json({ error: '请先打开或恢复已有的总控会话' });
+    }
+    return res.status(202).json(weixin.startPairing({ engine, sessionId }));
+  });
+  app.post(`${weixinUrl}/verify`, (req, res) => res.json(weixin.verify(str(get(req.body, 'pin')) || '')));
+  app.delete(weixinUrl, async (_req, res) => res.json(await weixin.disconnect()));
+  app.post('/api/coordinator/:engine/open', async (req, res) => res.json(await coordinator.open(engineOf(req))));
+  app.post('/api/coordinator/:engine/prepare', async (req, res) => {
+    await coordinator.prepare(engineOf(req));
+    res.json({ opened: true });
+  });
+  app.post('/api/coordinator/:engine/reset', async (req, res) => {
+    res.json(await coordinator.reset(engineOf(req)));
+  });
+  app.get('/api/coordinator/:engine/tasks', (req, res) => res.json(coordinator.tasks(engineOf(req))));
+  app.get('/api/coordinator/:engine/models', async (req, res) => res.json(await engineOf(req).models()));
+  app.put('/api/coordinator/:engine/session/:id', async (req, res) => {
+    await coordinator.bind(engineOf(req), req.params.id);
+    res.json({ bound: true });
+  });
+  app.post('/api/coordinator/:engine/session', async (req, res) => {
+    const engine = engineOf(req);
+    res.json(await coordinator.create(engine, validateInput(req.body), input => createSession(engine, input)));
   });
   app.post('/api/sessions/:engine/:id/messages', async (req, res) => {
-    const blocked = await sendBlocked(engineOf(req), req.params.id);
+    const engine = engineOf(req);
+    const blocked = await sendBlocked(engine, req.params.id);
     if (blocked) return res.status(409).json({ error: blocked });
-    const input = validateInput(req.body);
+    const input = await coordinator.messageInput(engine, req.params.id, validateInput(req.body));
     if (!input.prompt) return res.status(400).json({ error: '请输入消息或添加附件' });
     // While a turn runs, a message either joins it (steer) or waits for it to end (queue).
     const mode = get(req.body, 'mode');
@@ -500,7 +587,7 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     if (res.headersSent) return next(err);
     res.status(statusOf(err, isUploadError(err) ? 400 : 500)).json({ error: messageOf(err) || '服务异常' });
   });
-  return { app, host, hub, runs, activity, async dispose() { for (const res of streams) res.end(); activity.dispose(); observer.dispose(); dictation.dispose(); runs.dispose(); await host.dispose(); } };
+  return { app, host, hub, runs, activity, async dispose() { for (const res of streams) res.end(); await groups.dispose(); await weixin.dispose(); activity.dispose(); observer.dispose(); dictation.dispose(); await coordinator.dispose(); runs.dispose(); await host.dispose(); } };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) createApp().then(context => {
   const config = loadConfig();

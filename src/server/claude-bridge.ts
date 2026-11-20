@@ -647,6 +647,19 @@ class ClaudeBridge {
     return meta;
   }
 
+  coordinationCatalog() {
+    const index = this.desktopIndex().filter(meta => !meta.isArchived);
+    const groups = this.manualGroups(), byLocal = new Map(index.map(meta => [meta.localId, meta]));
+    return index.flatMap(meta => {
+      if (!meta.id) return [];
+      const root = byLocal.get(meta.parentLocalId) || meta;
+      const project = root.localId && groups.get(root.localId);
+      return [{ id: meta.id, title: meta.title || '新会话', cwd: meta.cwd,
+        project: project ? project.name : path.basename(root.originCwd || root.cwd),
+        updatedAt: meta.lastActivityAt || meta.createdAt || 0 }];
+    });
+  }
+
   list(): UnifiedSession[] {
     const index = this.desktopIndex().filter(meta => !meta.isArchived);
     const groups = this.manualGroups();
@@ -669,6 +682,7 @@ class ClaudeBridge {
         updatedAt: new Date(meta.lastActivityAt || parsed.mtimeMs).toISOString(), cwd: meta.cwd || parsed.cwd,
         status: running ? 'busy' : 'idle', isDesktopActive: running,
         metadata: {
+          waitingFor: running && awaitingStep(latest, meta, parsed) ? 'approval' : undefined,
           recentMessages: recentMessages(parsed.turns), turnStartedAt: Date.parse(String(latest.timestamp)) || 0,
           latestTurn: latest.statusEvidence ? { id: latest.id, status: latest.status, completedAt: latest.completedAt, statusEvidence: latest.statusEvidence } : undefined,
           group: { ...((root.localId !== undefined && groups.get(root.localId)) || { id: `repo:${this.repoFor(root.cwd)}`, name: this.repoFor(root.cwd) }), cwd: folder },

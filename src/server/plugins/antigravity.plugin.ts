@@ -44,6 +44,8 @@ export const setup: PluginSetup = ({ config, registerEngine }) => {
       // macOS, UI Automation on Windows).
       cwd: true, approvals: true, openFile: true, showInDesktop: true },
     usage: () => bridge.getUsage(),
+    coordinator: { root: agyHome, groupMember: { root: agyHome }, catalog: cwd => bridge.coordinationCatalog(cwd), read: id => bridge.coordinationHistory(id),
+      defaultModel: () => bridge.coordinationDefaultModel(), modelForSend: session => session.metadata.desktop?.model },
     dictate: options => bridge.dictate(options), dictationReady: () => bridge.dictationReady(),
     status: () => bridge.getStatus(), models: () => bridge.getModels(),
     list: () => bridge.listConversations(), read: id => bridge.getConversationHistory(id),
@@ -58,6 +60,7 @@ export const setup: PluginSetup = ({ config, registerEngine }) => {
     fileRoots: id => bridge.fileRoots(id),
     // The language server's cancel, the call behind the desktop's stop button.
     interrupt: id => bridge.interrupt(id),
+    decideNative: (session, id, decision) => bridge.decideNative(session, id, decision),
     decide: (id, decision) => bridge.decide(id, decision),
     media: (id, key) => bridge.media(id, key),
     send: (id, input) => bridge.sendMessage({ ...input, conversationId: id }),

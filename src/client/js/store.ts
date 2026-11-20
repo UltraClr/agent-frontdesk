@@ -97,6 +97,13 @@ export class ConversationStore {
     // they get here; one that still did would get a turn of its own with a null id, as before.
     if (!turn) { turn = emptyTurn(event.turnId); this.turns.push(turn); }
     dispatch(this.handlers, turn, event);
+    if (event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.interrupted') {
+      turn.completedAt ??= event.timestamp;
+    }
+    if (event.type === 'message.updated' && event.data.status === 'completed') {
+      const message = turn.messages.find(message => message.id === event.data.id);
+      if (message) message.at ||= event.timestamp;
+    }
     return true;
   }
   get active(): PageTurn | undefined { return [...this.turns].reverse().find(turn => ['running', 'reconnecting'].includes(turn.status)); }

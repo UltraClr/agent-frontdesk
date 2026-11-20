@@ -131,21 +131,43 @@ func shownProject() -> String {
 // The project menu is a search box over a list of the desktop's projects, by name.
 func pickProject(_ project: String) throws {
   if project == ":none" {
-    if find("projectMenu") == nil, find("projectChooser") != nil { return }
-    guard let none = find("noProject") else { throw Stop(code: "no_project_menu", message: "Codex 桌面版的新建页上没有「不在项目里」这一项") }
-    press(none)
-    for _ in 0..<12 { wait(0.2); if find("projectMenu") == nil, find("projectChooser") != nil { return } }
+    func projectless() -> Bool { find("projectChooser") != nil && find("noProject") == nil }
+    if projectless() { return }
+    if let clear = find("noProject") {
+      press(clear)
+      if until(1.5, projectless) { return }
+    }
+    // The inline clear button can be hidden until hovered. The picker exposes the same action.
+    if open(projectMenu, opened: { find("projectList") != nil }) {
+      let clear = find("noProject")
+      let choices = findAll("projectlessOption").filter { choice in clear.map { !CFEqual($0, choice) } ?? true }
+      if choices.count == 1 {
+        press(choices[0])
+        if until(2.4, projectless) { return }
+      }
+      close(projectMenu)
+    }
     throw Stop(code: "project_not_set", message: "在 Codex 桌面版里选了不在项目里，但项目没有切换过去")
   }
   if shownProject() == project { return }
   guard open(projectMenu, opened: { find("projectList") != nil }) else { throw Stop(code: "no_project_menu", message: "没能打开 Codex 桌面版的项目菜单") }
-  let rows = find("projectList").flatMap { attr($0, "AXChildren") as? [AXUIElement] } ?? []
+  // Recent builds put project rows inside a group within the list.
   func text(_ row: AXUIElement) -> String { within(row) { role($0) == "AXStaticText" }.map(value).first { !$0.isEmpty } ?? label(row) }
-  guard let row = rows.first(where: { text($0) == project }) else { close(projectMenu); throw Stop(code: "project_unavailable", message: "Codex 桌面版的项目菜单里没有「\(project)」") }
-  press(row)
-  for _ in 0..<12 { wait(0.2); if shownProject() == project { break } }
+  func option() -> AXUIElement? {
+    let marked = findAll("projectRow")
+    let rows = marked.isEmpty ? find("projectList").flatMap { attr($0, "AXChildren") as? [AXUIElement] } ?? [] : marked
+    let options = rows.filter { text($0) == project }
+    return options.count == 1 ? options.first : nil
+  }
+  guard let row = option() else { close(projectMenu); throw Stop(code: "project_unavailable", message: "Codex 桌面版的项目菜单里没有「\(project)」") }
+  // Accessibility can see the entire list even when a project row is below the viewport.
+  act(row, "AXScrollToVisible")
+  anchor = row
+  wait(0.3)
+  guard let visible = option() else { close(projectMenu); throw Stop(code: "project_unavailable", message: "Codex 桌面版的项目菜单里没有「\(project)」") }
+  press(visible)
   anchor = nil
-  guard shownProject() == project else { close(projectMenu); throw Stop(code: "project_not_set", message: "在 Codex 桌面版里选了「\(project)」，但项目没有切换过去") }
+  guard until(4, { shownProject() == project }) else { close(projectMenu); throw Stop(code: "project_not_set", message: "在 Codex 桌面版里选了「\(project)」，但项目没有切换过去") }
 }
 
 let previous = startedOn()

@@ -1,0 +1,32 @@
+/* DeepSeek Harness's own colours, as variables of the shared kit (no copied kit styles). */
+html[data-engine="dsh"] {
+  --kit-accent: #4d6bfe;
+  --kit-blue: #3b5bfd;
+  --kit-side: #f6f7fb;
+  --kit-bg: #ffffff;
+  --kit-bubble: #eef1fe;
+  --kit-select: #e9edfe;
+  --kit-hover: #f1f3fa;
+}
+html[data-engine="dsh"][data-theme="dark"] {
+  --kit-accent: #6d86ff;
+  --kit-blue: #8fa3ff;
+  --kit-side: #14161c;
+  --kit-bg: #0f1115;
+  --kit-bubble: #232a44;
+  --kit-select: #222a44;
+  --kit-hover: #1a1d26;
+  --kit-rule: #262a35;
+}
+@media (prefers-color-scheme: dark) {
+  html[data-engine="dsh"]:not([data-theme="light"]) {
+    --kit-accent: #6d86ff;
+    --kit-blue: #8fa3ff;
+    --kit-side: #14161c;
+    --kit-bg: #0f1115;
+    --kit-bubble: #232a44;
+    --kit-select: #222a44;
+    --kit-hover: #1a1d26;
+    --kit-rule: #262a35;
+  }
+}

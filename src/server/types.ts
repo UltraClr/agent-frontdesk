@@ -61,6 +61,7 @@ export interface TurnInit {
   steps?: Step[];
   assistantReply?: string;
   artifacts?: Artifact[];
+  approvals?: Approval[];
   messages?: UnifiedMessage[];
   timeline?: TimelineEntry[];
   statusEvidence?: string | null;
@@ -73,9 +74,10 @@ export interface TurnInit {
 class UnifiedTurn implements Turn {
   id: string; userPrompt: string; timestamp: TimeValue; status: TurnStatus | string;
   statusEvidence: string | null; completedAt: TimeValue | null; steps: Step[]; assistantReply: string;
+  error?: string;
   artifacts: Artifact[]; messages: UnifiedMessage[]; timeline: TimelineEntry[]; userImages: MediaImage[];
   durationMs: number; workedMs: number; approvals?: Approval[];
-  constructor({ id, userPrompt = '', timestamp = new Date().toISOString(), status = 'completed', steps = [], assistantReply = '', artifacts = [], messages = [], timeline = [], statusEvidence = null, completedAt = null, userImages = [], durationMs = 0, workedMs = 0 }: TurnInit) {
+  constructor({ id, userPrompt = '', timestamp = new Date().toISOString(), status = 'completed', steps = [], assistantReply = '', artifacts = [], approvals, messages = [], timeline = [], statusEvidence = null, completedAt = null, userImages = [], durationMs = 0, workedMs = 0 }: TurnInit) {
     this.id = id || Math.random().toString(36).slice(2);
     this.userPrompt = userPrompt;
     this.timestamp = timestamp;
@@ -84,6 +86,7 @@ class UnifiedTurn implements Turn {
     this.steps = steps;
     this.assistantReply = assistantReply;
     this.artifacts = artifacts;
+    if (approvals?.length) this.approvals = approvals;
     this.messages = messages;
     this.timeline = timeline;
     // Pictures the person attached to their message: [{ url, alt }], url from the engine's media().

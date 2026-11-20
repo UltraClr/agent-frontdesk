@@ -4,17 +4,19 @@ import 'katex/dist/katex.min.css';
 import './style.css';
 import './kit/kit.css';
 import { t, say, locale, language, translateDocument } from './js/i18n.js';
-import { DraftBook, ReadMarkers, viewKey, isViewOf, preferredSession, quotaLabel } from './js/navigation.js';
+import { DraftBook, ReadMarkers, activityTime, readTime, visibleReplyTime, viewKey, isViewOf, preferredSession, quotaLabel, coordinatorTargets, deliveryReceipts } from './js/navigation.js';
 import { createStore } from './js/store.js';
 import { request, answer, connect, sessionUrl, type RequestOptions } from './js/api.js';
 import { nativeDictation, browserDictation, VoiceUnavailable } from './js/dictation.js';
 import { dictationOrder, AUTO_VOICE, BROWSER_VOICE } from '../shared/dictation.js';
 import { escape, icon, hydrateIcons, registerRenderer, renderers, markdown, character, quotaMeter, quotaCard, speechLine, windowName, onRenderers, needRenderer } from './js/renderers.js';
-import { enhanceSelect, showMenu } from './js/menu.js';
-import { renderSidebar, projectChoices, repoKey, SidebarPrefs, clampSidebarWidth, spacesOf, homeSpace, shownSpace, spaceOfItem, isInSpace, inSpace, renderSpaceSwitch, spaceMenuItems } from './js/sidebar.js';
+import { closeMenu, enhanceSelect, showMenu } from './js/menu.js';
+import { renderSidebar, sidebarViews, type SidebarView, projectChoices, repoKey, SidebarPrefs, clampSidebarWidth, spacesOf, homeSpace, shownSpace, spaceOfItem, isInSpace, inSpace, renderSpaceSwitch, spaceMenuItems } from './js/sidebar.js';
 import { avatarSvg, newAvatarSeed } from './js/avatar.js';
 import './js/diagrams.js';
 import { NewOptions } from './js/new-options.js';
+import { GroupPanel } from './js/groups.js';
+import { weixinDialog } from './js/weixin.js';
 import { agentRows, newAgentsView, AVATAR_TYPES, AVATAR_MAX_BYTES } from './js/agents.js';
 import { referenceChoices, insertReference, referenceMeta } from './js/references.js';
 import { fileActions, actionButtons, filePopover } from './js/file-actions.js';
@@ -26,11 +28,19 @@ import type { DictationSession } from './js/dictation.js';
 import type { DraftAttachment } from './js/navigation.js';
 import type { SideSession } from './js/sidebar.js';
 import type { Provider } from './js/renderers.js';
+import type { CoordinatorTaskSummary, CoordinatorView } from '../shared/contract.js';
 import type { ActivityEntry, ActivityNotice, ActivitySnapshot, AgentBusy, AgentEntry, CardAction, CardRead, CreateResult, DictationInfo, DictationSkip, DictationSource, EngineManifest, EngineStatus, EnginesResponse, FilePreview, Model, Project, QueuedMessage, SessionHistoryResponse, SessionMetadata, Space, ChatReference, Usage, UnifiedSession, WrapUpCard } from '../shared/contract.js';
 
 // The page's elements by id (index.html), each with the kind it is there. `$` checks the kind,
 // so markup that changes shows up as an error where it is looked up.
 const ELEMENTS = {
+  'open-coordinator': HTMLButtonElement,
+  'coordinator-pane': HTMLElement,
+  'group-panel': HTMLElement,
+  'unassigned-receipts': HTMLElement,
+  'coordinator-meter': HTMLSpanElement,
+  'coordinator-quota': HTMLSpanElement,
+  'weixin-dialog': HTMLDialogElement,
   'add-engine': HTMLButtonElement,
   'agents-content': HTMLDivElement,
   'agents-dialog': HTMLDialogElement,
@@ -92,6 +102,8 @@ const ELEMENTS = {
   'send-blocked': HTMLDivElement,
   'send-blocked-text': HTMLSpanElement,
   'session-count': HTMLSpanElement,
+  'sidebar-view': HTMLButtonElement,
+  'sidebar-view-label': HTMLSpanElement,
   'session-cwd': HTMLSpanElement,
   'session-info': HTMLButtonElement,
   'show-desktop': HTMLButtonElement,
@@ -135,6 +147,7 @@ function $(id: ElementId): HTMLElement { return byId(id, ELEMENTS[id]); }
 const storageFor = (name: 'localStorage' | 'sessionStorage'): Storage | null => { try { return name === 'localStorage' ? window.localStorage : window.sessionStorage; } catch { return null; } };
 const drafts = new DraftBook(storageFor('sessionStorage'));
 const markers = new ReadMarkers(storageFor('localStorage'));
+const savedRead = new Map<string, number>();
 /**
  * The chat the page shows: one the server listed or read (UnifiedSession), or, while it is being
  * read, a stand-in with only its id, title and engine.
@@ -163,7 +176,14 @@ const views = new Map<string, CachedView>(), sending = new Set<string>(), stoppi
 const readLastSessions = (): Record<string, string> => { try { return JSON.parse(storageFor('sessionStorage')?.getItem('desktop-bridge:last-sessions') || '{}'); } catch { return {}; } };
 const state: AppState = { projectDir: '', notices: [], httpsPort: null, voice: { preferred: '', sources: [] }, dictation: null, activity: [], usage: {}, usageLoaded: false, overview: null, lastSessions: readLastSessions(), controller: null, motion: null, refreshing: false, engines: [], agents: [], sessions: {}, projects: {}, models: {}, statuses: {}, engine: '', session: null, store: createStore(), stream: null, view: 0, loading: false, submitting: false, creating: false, uploading: 0, attachments: [], follow: true, dirty: false, ready: false, defaultCwd: '', refreshErrors: {} };
 const engine = (id?: string | null): EngineManifest | undefined => state.engines.find(item => item.id === (id || state.engine));
-const currentKey = () => viewKey(state.engine, state.session?.id);
+const openWeixin = weixinDialog($('weixin-dialog'), id => engine(id)?.label || id || t('总控'));
+let coordinatorMode = false, coordinatorView: CoordinatorView | null = null, coordinatorLoad = 0;
+let controllers: Array<{ id: string; label: string; controller: boolean }> = [];
+const coordinatorPreference = 'desktop-bridge:coordinator';
+function savedCoordinator(): string {
+  try { return storageFor('localStorage')?.getItem(coordinatorPreference) || ''; } catch { return ''; }
+}
+const currentKey = () => viewKey(state.engine, state.session?.id ?? (coordinatorMode ? ':coordinator' : null));
 // Only called with a chat open (sending, stopping, queue and approval buttons belong to one).
 const endpoint = () => sessionUrl(state.engine, state.session?.id ?? '');
 // The name of a caught error (AbortError, NotAllowedError…); undefined for anything without one.
@@ -175,7 +195,7 @@ const blockedReason = () => state.session?.sendBlocked || capsOf()?.sendBlocked 
 const sidePrefs = new SidebarPrefs(storageFor('localStorage'));
 // The desktop's mode the sidebar shows for an engine (plugin `spaces`; '' when it has none), and
 // that mode's entry ({ id, label, unavailable? }).
-const spaceId = (id = state.engine) => { const spaces = spacesOf(engine(id)); return spaces.length ? shownSpace(spaces, sidePrefs.space(id)) : ''; };
+const spaceId = (id = state.engine) => { const spaces = spacesOf(engine(id)); return spaces.length ? (coordinatorMode ? homeSpace(spaces) : shownSpace(spaces, sidePrefs.space(id))) : ''; };
 const space = (id = state.engine) => spacesOf(engine(id)).find(item => item.id === spaceId(id)) || null;
 // What the engine can do here: its own capabilities, narrowed by the desktop mode the chat is in
 // (or, with no chat open, the mode shown; plugin `spaces[].capabilities`) and by the chat itself.
@@ -193,7 +213,10 @@ const aimedProject = () => (newProject && newProject.engine === state.engine && 
 // projects ('any': a mode whose projects are not folders) or none.
 const projectPlus = () => { if (noNewReason()) return false; const caps = { ...(engine()?.capabilities || {}), ...(space()?.capabilities || {}) }; return caps.cwd === false ? (newInMode() ? 'any' : false) : !!caps.cwd; };
 // Why a new chat cannot start in the mode shown ('' when it can).
-const noNewReason = () => space()?.unavailable || space()?.noNew || '';
+const noNewReason = () => {
+  const caps = engine()?.capabilities;
+  return space()?.unavailable || space()?.noNew || (caps?.send === false ? caps.sendBlocked : '') || '';
+};
 // Where a new chat can go: the projects of the mode new chats start in (the default one).
 const newChoices = () => { const spaces = spacesOf(engine()), home = homeSpace(spaces); return projectChoices(inSpace(state.sessions[state.engine] || [], spaces, home), inSpace(state.projects[state.engine] || [], spaces, home)); };
 // Opening a session shows the mode it is in.
@@ -230,9 +253,26 @@ function sidebar(open: boolean): void {
   if (matchMedia('(max-width:767px)').matches && (open || wasOpen)) (open ? $('close-sidebar') : $('toggle-sidebar')).focus();
 }
 function activityFor(engineId: string, id: string): ActivityEntry | undefined { return state.activity.find(item => item.engine === engineId && item.sessionId === id); }
-function markCurrentRead() {
-  if (!state.session || state.loading || document.hidden) return;
-  markers.mark(state.engine, state.session.id);
+async function loadReadMarkers() {
+  try {
+    const entries = await request<Record<string, number>>('/api/read-markers');
+    for (const [key, at] of Object.entries(entries)) savedRead.set(key, Math.max(savedRead.get(key) || 0, at));
+    if (markers.merge(entries)) { renderDock(); renderSessionList(); }
+  } catch { /* Browser marks still work when the service cannot be reached. */ }
+}
+function markCurrentRead(): boolean {
+  const { session, engine, store } = state;
+  if (coordinatorMode || !session || state.loading || document.hidden || !store.turns.length) return false;
+  const at = Math.floor(Math.max(visibleReplyTime(store.turns), session.metadata?.attention ? readTime(session.updatedAt) : 0));
+  if (!at) return false;
+  const changed = markers.mark(engine, session.id, at);
+  const key = viewKey(engine, session.id), previous = savedRead.get(key) || 0;
+  if (at <= previous) return changed;
+  savedRead.set(key, at);
+  void request<{ at: number }>(sessionUrl(engine, session.id) + '/read', { method: 'PUT', body: JSON.stringify({ at }), keepalive: true })
+    .then(result => { savedRead.set(key, Math.max(savedRead.get(key) || 0, result.at)); })
+    .catch(() => { if (savedRead.get(key) === at) savedRead.set(key, previous); });
+  return changed;
 }
 // The agent rail: each engine as a contact in a chat app. Its character, its name, a bar per
 // quota window, the count of unread replies on the avatar's corner, and a speech bubble that types
@@ -264,7 +304,7 @@ function speechFor(provider: EngineManifest, running: boolean, usage: Usage | un
   return { text: t('在这儿，随时可以开始'), key: 'idle', live: false, at: 0 };
 }
 function quotaSummary(usage: Usage | undefined): string {
-  if (!state.usageLoaded) return t('正在读取额度');
+  if (!state.usageLoaded && !usage) return t('正在读取额度');
   if (!usage?.available) return say(usage?.reason?.split('\n')[0]) || t('额度未公开');
   // An available quota always has its windows (UsageService); a missing percent rounds to NaN, as before.
   return (usage.windows || []).map(window => t('{label} 剩 {percent}%', { label: windowName(window), percent: Math.round(window.remainingPercent ?? NaN) })).join(' · ');
@@ -289,6 +329,17 @@ function retireTile(tile: HTMLElement): void {
 }
 // Whether the rail has been drawn once: an agent that appears after that has just been switched on, and steps in.
 let dockDrawn = false;
+function renderCoordinatorQuota(): void {
+  const id = savedCoordinator(), provider = id ? engine(id) : undefined;
+  const button = $('open-coordinator'), usage = provider ? state.usage[provider.id] : undefined;
+  button.style.setProperty('--hue', provider?.accent || 'var(--accent)');
+  setHTML($('coordinator-meter'), provider ? quotaMeter(usage) : '');
+  const head = `<span class="card-name">${t('总控')}</span>`;
+  const details = provider
+    ? quotaCard(usage, !!usage, `${head}<span class="card-status">${t('由 {name} 担任总控', { name: escape(provider.label) })}</span><span class="card-rule"></span>`)
+    : `<span class="quota-card">${head}<span class="quota-card-note">${t('尚未选择总控')}</span></span>`;
+  setHTML($('coordinator-quota'), details);
+}
 function renderDock() {
   const dock = $('engine-dock');
   if (!dock.querySelector('[data-engine]')) dock.innerHTML = '';
@@ -301,6 +352,7 @@ function renderDock() {
   state.engines.forEach((provider, index) => {
     const activity = state.activity.filter(item => item.engine === provider.id);
     const running = activity.some(item => item.running), unread = activity.filter(item => markers.unread(item));
+    const waiting = activity.filter(item => item.waitingFor).length;
     const usage = state.usage[provider.id], quota = quotaSummary(usage);
     const speech = speechFor(provider, running, usage);
     if (speech.until) nextExpiry = Math.min(nextExpiry, speech.until);
@@ -331,19 +383,19 @@ function renderDock() {
     // (Windows: the last time the console worked the app's window from behind, the window did not come back where it was.)
     const misplaced = reach?.park?.issues.includes('placement') ? t('上次在后台操作后，窗口没有回到原位') : '';
     const reachNote = reach?.error ? say(reach.error) : [stale.length ? t('{n} 个控件的认法要更新：{keys}', { n: stale.length, keys: stale.join(', ') }) : '', misplaced].filter(Boolean).join(' · ');
-    const status = running ? t('正在工作') : unread.length ? t('{n} 条新消息', { n: unread.length }) : t('就绪');
+    const status = waiting ? t('{n} 个会话待你处理', { n: waiting }) : running ? t('正在工作') : unread.length ? t('{n} 条新消息', { n: unread.length }) : t('就绪');
     const name = escape(provider.label), key = `<kbd>⌥${index + 1}</kbd>`;
     // The hover card: who this is, whether it can be reached, then every quota window by name.
     const head = `<span class="card-head"><span class="card-name">${name}</span>${key}</span><span class="card-status">${link ? `<span class="status-dot is-${link.kind}"></span>${escape(reachNote ? `${link.text} · ${reachNote}` : link.text)} · ` : ''}${escape(status)}</span>${speech.live ? `<span class="card-said">${escape(speech.text)}<time>${escape(clock(speech.at))}</time></span>` : ''}<span class="card-rule"></span>`;
     // Drawn once as it stays (what the rail is compared by) and once with what happens only now:
     // the line typed out a character at a time, the count and the balloon popping in.
     const letters = () => Array.from(speech.text).map((char, at) => `<span style="--i:${at}">${escape(char)}</span>`).join('');
-    const draw = (typing: boolean, grew: boolean, entered: boolean) => `<button class="engine-switch${running ? ' is-working' : ''}${unread.length ? ' is-unread' : ''}" data-engine="${escape(provider.id)}" style="--hue:${escape(provider.accent || 'var(--accent)')}" aria-pressed="${state.engine === provider.id}" aria-label="${t('切换到')} ${name}, ${link ? `${escape(link.text)}, ` : ''}${escape(status)}, ${escape(quota)}" aria-keyshortcuts="Alt+${index + 1}">
-      <span class="engine-avatar">${running ? WORK_RING : ''}${character(provider, { working: running })}${unread.length ? unreadBadge(unread.length, unread.some(item => item.outcome === 'failed'), grew) : ''}${link ? `<span class="link-dot is-${link.kind}" aria-hidden="true"></span>` : ''}</span>
+    const draw = (typing: boolean, grew: boolean, entered: boolean) => `<button class="engine-switch${running ? ' is-working' : ''}${unread.length ? ' is-unread' : ''}" data-engine="${escape(provider.id)}" style="--hue:${escape(provider.accent || 'var(--accent)')}" aria-pressed="${!coordinatorMode && state.engine === provider.id}" aria-label="${t('切换到')} ${name}, ${link ? `${escape(link.text)}, ` : ''}${escape(status)}, ${escape(quota)}" aria-keyshortcuts="Alt+${index + 1}">
+      <span class="engine-avatar">${running ? WORK_RING : ''}${character(provider, { working: running })}${waiting ? `<span class="waiting-badge" data-show-waiting title="${escape(status)}">!${waiting}</span>` : ''}${unread.length ? unreadBadge(unread.length, unread.some(item => item.outcome === 'failed'), grew) : ''}${link ? `<span class="link-dot is-${link.kind}" aria-hidden="true"></span>` : ''}</span>
       <span class="engine-meta"><span class="engine-name">${name}</span>${key}${speech.live ? `<time class="engine-time">${escape(clock(speech.at))}</time>` : ''}</span>
       <span class="speech-bubble${open ? ' is-shown' : chip ? ' is-chip' : ''}${entered ? ' is-entering' : ''}${speech.warn ? ' is-warning' : ''}${speech.live ? '' : ' is-quiet'}">${chip ? TYPING : ''}<span class="speech-text${typing ? ' is-typing' : ''}" aria-live="${running ? 'polite' : 'off'}">${typing ? letters() : escape(speech.text)}${speech.key === 'thinking' ? TYPING : ''}</span></span>
       ${quotaMeter(usage)}
-      ${quotaCard(usage, state.usageLoaded, head)}
+      ${quotaCard(usage, state.usageLoaded || !!usage, head)}
     </button>`;
     const previous = dockMarkup.get(provider.id), plain = draw(false, false, false), markup = typing || grew || entered ? draw(typing, grew, entered) : plain;
     const node = find($('engine-dock'), `[data-engine="${CSS.escape(provider.id)}"]`);
@@ -368,7 +420,7 @@ function renderDock() {
   if (state.ready) dockDrawn = true;
   // The agent whose window is open stays in view when the rail has more agents than fit.
   if (railEngine !== state.engine) { railEngine = state.engine; find($('engine-dock'), '.engine-switch[aria-pressed="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
-  placeDock();
+  renderCoordinatorQuota(); placeDock();
   clearTimeout(dockTimer);
   if (Number.isFinite(nextExpiry)) dockTimer = window.setTimeout(renderDock, Math.max(200, nextExpiry - Date.now() + 50));
 }
@@ -379,11 +431,12 @@ function renderDock() {
 // Everything is read first and written after, so the page is laid out once however many agents.
 function placeDock(): void {
   const rail = $('engine-dock').getBoundingClientRect();
-  const tiles = findAll($('engine-dock'), '.engine-switch').map(tile => ({ tile, box: tile.getBoundingClientRect(), card: find(tile, '.quota-card') }));
+  const coordinator = $('open-coordinator');
+  const tiles = [coordinator, ...findAll($('engine-dock'), '.engine-switch')].map(tile => ({ tile, box: tile.getBoundingClientRect(), card: find(tile, '.quota-card') }));
   for (const { tile, box, card } of tiles) {
     tile.style.setProperty('--tile-x', `${Math.round(box.left)}px`); tile.style.setProperty('--tile-y', `${Math.round(box.top)}px`); tile.style.setProperty('--tile-w', `${Math.round(box.width)}px`);
     // (Shown or hidden before its card is measured: a hidden card has no height to place it by.)
-    tile.classList.toggle('is-offstage', box.bottom < rail.top + 16 || box.top > rail.bottom - 16);
+    tile.classList.toggle('is-offstage', tile !== coordinator && (box.bottom < rail.top + 16 || box.top > rail.bottom - 16));
     card?.classList.remove('is-dense');
   }
   // (A card's own height stops at the page's; what it holds is measured, to know it does not fit.)
@@ -405,26 +458,42 @@ document.addEventListener('pointermove', event => {
     bubble.classList.toggle('is-yielding', event.clientX > box.left - 10 && event.clientX < box.right + 10 && event.clientY > box.top - 10 && event.clientY < box.bottom + 10);
   }
 }, { passive: true });
-// The list is the shared sidebar (js/sidebar.ts): projects, then every chat newest first ("最近"). A skin may still
+// Each agent uses the shared sidebar and remembers its selected view. A skin may still
 // draw its own with a `session-list:<id>` renderer; `renderDefault()` gives it the shared one.
 let listMarkup: string | null = null;
+let listScope = '';
 function renderSessionList() {
   const query = $('session-search').value.trim().toLocaleLowerCase();
   const spaces = spacesOf(engine()), shown = spaceId(), mode = space();
+  const view = sidePrefs.view(state.engine);
+  const scope = JSON.stringify([state.engine, shown, view, query]);
+  if (scope !== listScope) { $('session-list').scrollTop = 0; listScope = scope; }
+  $('sidebar-view-label').textContent = t(sidebarViews[view]);
+  $('sidebar-view').setAttribute('aria-label', t('列表显示 · {view}', { view: t(sidebarViews[view]) }));
   setHTML($('space-switch'), renderSpaceSwitch(spaces, shown, { label: t('{name} 的模式', { name: engine()?.label || '' }) }));
   $('space-switch').hidden = !spaces.length; $('sidebar-agent').hidden = !!spaces.length;
-  const sessions = inSpace(state.sessions[state.engine] || [], spaces, shown).filter(item => `${item.title} ${item.cwd} ${item.metadata?.group?.name || ''}`.toLocaleLowerCase().includes(query));
-  $('session-count').textContent = String(sessions.length);
+  const catalog = state.sessions[state.engine] || [];
+  const catalogIds = new Set(catalog.map(item => item.id));
+  const newWaiting: PageSession[] = view === 'waiting' ? state.activity.filter(item => item.engine === state.engine && item.waitingFor && !catalogIds.has(item.sessionId))
+    .map(item => ({ id: item.sessionId, title: item.title || item.sessionId, engine: item.engine })) : [];
+  // The waiting inbox spans this agent’s desktop modes, just like its badge.
+  const sessions = (view === 'waiting' ? [...catalog, ...newWaiting] : inSpace(catalog, spaces, shown)).filter(item => `${item.title} ${item.cwd} ${item.metadata?.group?.name || ''}`.toLocaleLowerCase().includes(query));
   const error = state.refreshErrors[state.engine] || (mode?.unavailable && !sessions.length ? mode.unavailable : ''), projects = inSpace(state.projects[state.engine] || [], spaces, shown);
   // A chat has news when it finished or said something since it was last opened here, or when the
   // desktop marks it for a look (metadata.attention) and it has not been opened here since.
+  const activityById = new Map(state.activity.filter(item => item.engine === state.engine).map(item => [item.sessionId, item]));
   const status = (item: PageSession) => {
-    const activity = activityFor(state.engine, item.id), flagged = !!item.metadata?.attention && markers.unread({ engine: state.engine, sessionId: item.id, completedAt: Date.parse(String(item.updatedAt)) || 0 });
-    return { running: activity ? activity.running : item.status === 'busy', unread: !!(activity && markers.unread(activity)) || flagged, draft: !!drafts.get(viewKey(state.engine, item.id)).text };
+    const activity = activityById.get(item.id);
+    const attentionAt = item.metadata?.attention ? readTime(item.updatedAt) : 0;
+    const unreadAt = Math.max(attentionAt, activityTime(activity || {}));
+    return { waitingFor: activity ? activity.waitingFor : item.metadata?.waitingFor, running: activity ? activity.running : item.status === 'busy',
+      unread: markers.unread({ engine: state.engine, sessionId: item.id, lastMessageAt: unreadAt }), unreadAt,
+      draft: !!drafts.entries.get(viewKey(state.engine, item.id))?.text };
   };
+  $('session-count').textContent = String(view === 'waiting' ? sessions.filter(item => status(item).waitingFor).length : sessions.length);
   const renderDefault = () => renderSidebar(sessions, { projects, engineId: state.engine, space: shown, currentId: state.session?.id || '', query, status, time: item => relativeTime(item.updatedAt), prefs: sidePrefs, newChat: projectPlus() });
   const skinList = renderers.get(`session-list:${state.engine}`) || renderers.get('session-list:kit');
-  const markup = sessions.length || (!query && projects.length)
+  const markup = sessions.length || projects.length && (!query || view === 'projects' || view === 'pinned') || (!error && view !== 'all')
     ? (skinList ? skinList(sessions, { currentId: state.session?.id, query, escape, icon, relativeTime, provider: engine(), status, projects, renderDefault }) : renderDefault())
     : `<p class="quiet-state">${escape(say(error) || (query ? t('没有匹配的聊天') : t('还没有聊天，从新建聊天开始')))}</p>`;
   if (markup === listMarkup) return;
@@ -476,14 +545,26 @@ function animateView() {
 function renderUsage() {
   $('usage-content').innerHTML = state.engines.map(provider => `<section class="usage-engine" style="--hue:${escape(provider.accent || 'var(--accent)')}"><h3><span class="usage-face">${character(provider)}</span>${escape(provider.label)}${typeof state.usage[provider.id]?.plan === 'string' ? `<span class="count-chip">${escape(state.usage[provider.id]?.plan)}</span>` : ''}</h3>${quotaCard(state.usage[provider.id], state.usageLoaded).replace('class="quota-card"', 'class="quota-card is-inline"')}</section>`).join('');
 }
+const coordinatorUsageReads = new Set<string>();
+async function loadCoordinatorUsage(): Promise<void> {
+  const id = savedCoordinator();
+  if (!id || !engine(id) || coordinatorUsageReads.has(id) || Date.now() - Number(state.usage[id]?.['checkedAt'] || 0) < 60_000) return;
+  coordinatorUsageReads.add(id);
+  try { state.usage[id] = await request<Usage>(`/api/usage/${encodeURIComponent(id)}`); }
+  catch { state.usage[id] = { available: false, reason: t('额度暂不可用'), checkedAt: Date.now() }; }
+  finally { coordinatorUsageReads.delete(id); renderCoordinatorQuota(); placeDock(); }
+}
 async function loadUsage() {
+  if (coordinatorMode) return loadCoordinatorUsage();
   try { state.usage = await request('/api/usage'); state.usageLoaded = true; renderDock(); if ($('usage-dialog').open) renderUsage(); }
   catch { state.usageLoaded = true; renderDock(); }
 }
 function connectOverview() {
   state.overview?.close();
+  state.overview = null;
+  if (coordinatorMode) return;
   const source = new EventSource('/api/activity/events'); state.overview = source;
-  source.addEventListener('activity', event => { const snapshot = JSON.parse(event.data); state.activity = snapshot.sessions || []; state.notices = snapshot.notices || []; markCurrentRead(); renderDock(); renderSessionList(); });
+  source.addEventListener('activity', event => { const snapshot = JSON.parse(event.data); state.activity = snapshot.sessions || []; state.notices = snapshot.notices || []; renderDock(); renderSessionList(); });
   // An agent was switched on or off (here or on another page): the rail and the lists follow.
   source.addEventListener('engines', () => { void syncEngines(); });
 }
@@ -495,9 +576,10 @@ function renderHeader() {
   // Engines on the shared chat kit (src/client/kit) get its layout; their brand colour drives its accents.
   const accent = engine()?.accent;
   if (accent) document.documentElement.style.setProperty('--engine-accent', accent); else document.documentElement.style.removeProperty('--engine-accent');
-  $('session-title').textContent = state.session?.title || t('新建聊天');
-  $('session-cwd').textContent = state.session?.cwd?.split(/[\\/]/).filter(Boolean).at(-1) || '';
-  $('session-cwd').title = state.session?.cwd || '';
+  $('session-title').textContent = coordinatorMode ? t('总控') : state.session?.title || t('新建聊天');
+  const directory = (coordinatorMode ? coordinatorView?.cwd : state.session?.cwd) || '';
+  $('session-cwd').textContent = folderName(directory);
+  $('session-cwd').title = directory;
   $('engine-label').textContent = engine()?.label || '';
   // The sidebar's head says whose chats these are; the header's button names the app it opens.
   $('sidebar-agent').textContent = engine()?.label || ''; setHTML($('sidebar-face'), engine() ? character(engine()) : '');
@@ -536,6 +618,7 @@ function renderEffort() {
 function renderControls() {
   state.submitting = sending.has(currentKey()); state.uploading = uploads.get(currentKey()) || 0;
   const active = state.store.active;
+  const pending = (active?.approvals?.length ? active : state.store.turns.findLast(turn => turn.approvals?.length))?.approvals[0];
   const caps = capsOf();
   const desktopActive = caps.desktopInterrupt && (active || (!state.store.turns.length && state.session?.isDesktopActive));
   const canStop = caps.interrupt && (active?.source === 'console' || desktopActive);
@@ -550,7 +633,10 @@ function renderControls() {
   const sendLabel = !active ? t('发送消息') : capsOf().steer ? t('插入正在执行的这一轮（Enter）') : t('排队，这一轮结束后发送（Enter）');
   if ($('send').title !== sendLabel) { $('send').title = sendLabel; $('send').setAttribute('aria-label', sendLabel); }
   $('stop').disabled = stopRequested;
-  const blocked = state.session ? blockedReason() : capsOf()?.sendBlocked || noNewReason();
+  const setupDraft = coordinatorMode && !state.session && !!coordinatorView?.desktopSetup;
+  const setupBlocked = coordinatorMode && !state.session ? !coordinatorView ? t('请选择总控引擎') :
+    setupDraft ? t('请先在桌面发送总控初始化草稿') : coordinatorView.recovering ? t('正在确认总控会话') : '' : '';
+  const blocked = setupBlocked || (state.session ? blockedReason() : capsOf()?.sendBlocked || noNewReason());
   $('send-blocked').hidden = !blocked; $('send-blocked-text').textContent = say(blocked);
   $('composer').classList.toggle('is-blocked', !!blocked);
   $('send').disabled = !!blocked || !state.ready || !state.engine || state.loading || state.submitting || stopRequested || state.creating || state.uploading > 0 || !typed;
@@ -564,7 +650,7 @@ function renderControls() {
   $('dictate').classList.toggle('is-finishing', !!state.dictation?.stopping);
   const source = state.dictation?.label || voice.label;
   $('dictate').title = dictating ? t('结束语音输入') : voice.label ? `${t('语音输入 ·')} ${voice.label}` : `${t('语音输入不可用：')}${voice.why}`;
-  $('prompt').disabled = !!blocked || state.loading || !state.ready || state.creating;
+  $('prompt').disabled = (!!blocked && !setupDraft) || state.loading || !state.ready || state.creating;
   $('model').disabled = !!blocked || !(state.models[state.engine] || []).length || !capsOf().models;
   // No models to pick from: say why where the engine's usage says (Claude: its CLI is not signed in).
   const why = (state.models[state.engine] || []).length ? '' : state.usage[state.engine]?.reason || '';
@@ -574,10 +660,14 @@ function renderControls() {
   // The effort and permission menus follow the mode too (they are rebuilt when it changes).
   if (capsOf().reasoning === false ? !$('effort').hidden : $('effort').hidden && $('effort').dataset.mode === 'off') renderEffort();
   if ((capsOf().permissions === false) !== ($('permission').dataset.mode === 'off')) renderPermissions();
-  setHTML($('run-state'), state.dictation ? `<span class="recording-dot" aria-hidden="true"></span>${state.dictation.stopping ? t('正在整理识别结果…') : `${t('正在听写 ·')} ${escape(source)} ${t('· 再点话筒结束，Esc 取消')}`}` : stopRequested ? t('正在停止…') : state.uploading ? t('正在上传附件…') : state.creating ? t('正在新建聊天…') : state.submitting ? t('正在发送…') : (active || desktopActive) ? `<span class="activity-spinner" aria-hidden="true"></span>${active?.approvals?.length ? t('等待操作批准') : active?.status === 'reconnecting' ? t('正在确认引擎状态') : t('正在执行')}${!canStop ? t(' · 请在桌面端停止任务') : ''}` : '');
+  const waiting = pending?.kind === 'input' ? t('等待你的回答') : pending?.kind === 'plan' ? t('等待确认计划') : pending ? t('等待操作批准') : '';
+  setHTML($('run-state'), state.dictation ? `<span class="recording-dot" aria-hidden="true"></span>${state.dictation.stopping ? t('正在整理识别结果…') : `${t('正在听写 ·')} ${escape(source)} ${t('· 再点话筒结束，Esc 取消')}`}` : stopRequested ? t('正在停止…') : state.uploading ? t('正在上传附件…') : state.creating ? t('正在新建聊天…') : state.submitting ? t('正在发送…') : waiting || ((active || desktopActive) ? `<span class="activity-spinner" aria-hidden="true"></span>${active?.status === 'reconnecting' ? t('正在确认引擎状态') : t('正在执行')}${!canStop ? t(' · 请在桌面端停止任务') : ''}` : ''));
   renderQueue();
-  $('composer-context').textContent = state.session?.cwd ? `${t('工作目录 ·')} ${state.session.cwd.split(/[\\/]/).filter(Boolean).at(-1)}` : t('任务由 {name} 执行', { name: engine()?.label || t('桌面引擎') });
-  $('new-chat').disabled = !state.engines.length || !!noNewReason();
+  const directory = state.session?.cwd || (coordinatorMode ? coordinatorView?.cwd : '');
+  $('composer-context').textContent = directory ? `${t('工作目录 ·')} ${folderName(directory)}` : t('任务由 {name} 执行', { name: engine()?.label || t('桌面引擎') });
+  const cannotCreate = noNewReason();
+  $('new-chat').disabled = !state.engines.length || !!cannotCreate;
+  $('new-chat').title = cannotCreate ? say(cannotCreate) : '';
   renderNewTarget();
 }
 // A new chat is the empty composer itself, as in the desktop apps: pick the project it belongs
@@ -613,7 +703,7 @@ function setNewTarget(cwd: string): void {
   renderNewTarget();
 }
 function renderNewTarget() {
-  const target = state.session ? null : newTarget();
+  const target = state.session || coordinatorMode ? null : newTarget();
   $('new-target-row').hidden = !target;
   if (!target) { $('new-target-path').hidden = true; $('new-target').hidden = false; return; }
   $('new-target-name').textContent = target.cwd ? target.name : t('不指定项目');
@@ -652,6 +742,7 @@ function newChat(project: { id: string; name: string; cwd?: string | undefined }
   renderControls(); $('prompt').focus();
 }
 function emptyView() {
+  if (coordinatorMode) return coordinatorWelcome();
   // No agent is switched on: the page offers the ones the console knows, each with its switch.
   if (state.ready && !state.engines.length) return `<div class="empty-conversation agents-welcome"><img class="welcome-logo" src="/assets/logo/logo-128.png" width="56" height="56" alt=""><h2>${t('先接上一个 Agent')}</h2><p>${t('Agent Frontdesk 是桌面版 AI 的远程窗口。打开一个 Agent 的开关，就能在这里看它的聊天、给它发消息，任务仍由它的桌面版执行。')}</p><div id="welcome-agents">${agentsMarkup()}</div>${onboardEntry()}</div>`;
   // The agent's own character greets an empty chat, in every engine.
@@ -672,12 +763,26 @@ function emptyView() {
   if (elsewhere) return `<div class="empty-conversation">${face}<div class="workspace-label">${icon('messages-square')}<span>${escape(engine()?.label || '')}${space() ? ` · ${escape(space()?.label)}` : ''}</span></div><h2>${escape(state.session?.title || t('聊天'))}</h2><p>${escape(say(elsewhere))}</p></div>`;
   return `<div class="empty-conversation">${face}<div class="workspace-label">${icon('messages-square')}<span>${escape(engine()?.label || t('本地引擎'))} ${t('工作台')}</span></div><h2>${t('从一条消息开始')}</h2><p>${t('说说你想完成的事。回复、执行进度和产物都会留在这里。')}</p><div class="empty-note">${icon('folder-open')}<span>${t('文件编辑留在原工作区，聊天负责调度与交付')}</span></div></div>`;
 }
+function receiptDetails(tasks: CoordinatorView['tasks']) {
+  return tasks.map(task => {
+    const target = `${engine(task.engine)?.label || task.engine} · ${task.title || task.target}`;
+    const status = t(coordinatorState(task));
+    const href = '#' + [task.engine, task.target, ...(task.nativeTurn ? [task.nativeTurn] : [])].map(encodeURIComponent).join('/');
+    return `<details class="dispatch-receipt" data-disclosure="receipt-${escape(task.id)}"><summary>${escape(target)} · ${escape(status)}</summary>
+      <p>${escape(task.prompt)}</p>
+      ${task.error ? `<p>${escape(say(task.error))}</p>` : ''}
+      ${task.reply ? `<p><strong>${t('目标回复')}</strong><br>${escape(task.reply)}</p>` : ''}
+      <a href="${escape(href)}">${t('打开目标会话')}</a></details>`;
+  }).join('');
+}
 let renderedTurns = new Map();
 function renderConversation() {
   const container = $('conversation');
-  const open = new Set(findAll($('timeline'), 'details[open]').map(element => element.dataset['disclosure']));
+  const receipts = deliveryReceipts(coordinatorMode && coordinatorView?.sessionId === state.session?.id ? coordinatorView?.tasks || [] : [], state.store.turns);
+  const open = new Set(findAll(container, 'details[open]').map(element => element.dataset['disclosure']));
   const scrollTop = container.scrollTop;
   const focused = closest(document.activeElement, '[data-disclosure]')?.dataset['disclosure'];
+  const focusedQuestion = closest(document.activeElement, '[data-approval-form] input, [data-approval-form] textarea, [data-approval-form] button');
   if (state.loading || !state.store.turns.length) {
     renderedTurns.clear();
     $('timeline').innerHTML = state.loading ? ("<p class=\"quiet-state\" role=\"status\">" + t('正在读取聊天记录…') + "</p>") : emptyView();
@@ -688,24 +793,42 @@ function renderConversation() {
     const nodes = new Map(childrenOf($('timeline')).map(node => [node.dataset['turn'], node]));
     const drawTurn = renderers.get(`turn:${state.engine}`) || renderers.get('turn:kit');
     for (const turn of state.store.turns) {
-      const html = drawTurn ? drawTurn(turn, { label: engine()?.label || '', provider: engine() || {}, markdown, character, escape, icon }) : '';
+      const body = drawTurn ? drawTurn(turn, { label: engine()?.label || '', provider: engine() || {}, markdown, character, escape, icon }) : '';
+      const receipt = turn.id && receipts.get(turn.id);
+      const extra = receipt ? receiptDetails(receipt) : '';
+      const html = body + extra;
       const node = turn.id ? nodes.get(turn.id) : undefined;
       if (renderedTurns.get(turn.id) !== html || !node) {
-        const template = document.createElement('template'); template.innerHTML = html;
+        const template = document.createElement('template'); template.innerHTML = body;
         // A turn renderer returns one <article>.
         const next = template.content.firstElementChild;
-        if (next) { if (node) node.replaceWith(next); else $('timeline').append(next); }
+        if (next && extra) next.insertAdjacentHTML('beforeend', extra);
+        if (next && node) {
+          // A desktop update can redraw the turn while the person is filling out its form.
+          const forms = findAll(node, 'form[data-approval-form]', HTMLFormElement);
+          for (const form of findAll(next, 'form[data-approval-form]', HTMLFormElement)) {
+            const previous = forms.find(old => old.dataset.approvalForm === form.dataset.approvalForm && old.innerHTML === form.innerHTML);
+            if (previous) form.replaceWith(previous);
+          }
+          node.replaceWith(next);
+        } else if (next) $('timeline').append(next);
         renderedTurns.set(turn.id, html);
       }
     }
     for (const id of renderedTurns.keys()) if (!ids.has(id)) renderedTurns.delete(id);
   }
-  for (const element of $('timeline').querySelectorAll('details')) if (open.has(element.dataset['disclosure'])) element.open = true;
+  const unassigned = receipts.get('');
+  const fallback = $('unassigned-receipts');
+  fallback.hidden = !unassigned?.length || state.loading;
+  setHTML(fallback, unassigned?.length ? `<details data-disclosure="dispatch-history"><summary>${t('派发记录')} (${unassigned.length})</summary>${receiptDetails(unassigned)}</details>` : '');
+  for (const element of container.querySelectorAll('details')) if (open.has(element.dataset['disclosure'])) element.open = true;
   hydrateIcons();
   if (focused) findAll($('timeline'), '[data-disclosure]').find(node => node.dataset['disclosure'] === focused)?.querySelector('summary')?.focus({ preventScroll: true });
+  if (focusedQuestion?.isConnected && focusedQuestion !== document.activeElement) focusedQuestion.focus({ preventScroll: true });
   if (state.follow) container.scrollTop = container.scrollHeight; else container.scrollTop = scrollTop;
   $('jump-bottom').hidden = state.follow || !state.store.turns.length;
   renderControls();
+  if (markCurrentRead()) { renderDock(); renderSessionList(); }
 }
 let renderPending = false;
 function scheduleRender() { if (renderPending) return; renderPending = true; requestAnimationFrame(() => { renderPending = false; renderConversation(); }); }
@@ -744,6 +867,7 @@ function renderAttachments() {
   hydrateIcons(); renderControls();
 }
 async function refresh() {
+  if (coordinatorMode) return;
   // engine → its chats (or { error }), and engine → its projects.
   const [data, projects] = await Promise.all([request<Record<string, UnifiedSession[] | { error?: string }>>('/api/sessions'), request<Record<string, Project[]>>('/api/projects').catch((): Record<string, Project[]> => ({}))]);
   for (const item of state.engines) {
@@ -779,7 +903,7 @@ function subscribe(view: number): void {
 }
 async function selectSession(id: string, { engineId = state.engine, route = true, force = false } = {}): Promise<void> {
   if (!engine(engineId)) return;
-  if (!force && state.engine === engineId && state.session?.id === id && !state.loading) { markCurrentRead(); renderDock(); return; }
+  if (!force && state.engine === engineId && state.session?.id === id && !state.loading) { markCurrentRead(); renderDock(); renderSessionList(); return; }
   rememberView(); state.controller?.abort(); closeStream();
   const view = ++state.view, key = viewKey(engineId, id), cached = views.get(key);
   state.engine = engineId; state.loading = !cached; state.refreshing = !!cached;
@@ -790,9 +914,11 @@ async function selectSession(id: string, { engineId = state.engine, route = true
   renderedTurns = cached?.rendered || new Map();
   const node = cached?.node || Object.assign(document.createElement('div'), { id: 'timeline', className: 'timeline' });
   if ($('timeline') !== node) $('timeline').replaceWith(node);
-  state.lastSessions[engineId] = id;
-  try { storageFor('sessionStorage')?.setItem('desktop-bridge:last-sessions', JSON.stringify(state.lastSessions)); } catch {}
-  restoreDraft(); markCurrentRead(); notify('');
+  if (!coordinatorMode) {
+    state.lastSessions[engineId] = id;
+    try { storageFor('sessionStorage')?.setItem('desktop-bridge:last-sessions', JSON.stringify(state.lastSessions)); } catch {}
+  }
+  restoreDraft(); notify('');
   renderHeader(); renderDock(); renderSessionList(); renderConversation();
   if (cached && !cached.follow) $('conversation').scrollTop = cached.scrollTop;
   sidebar(!matchMedia('(max-width:767px)').matches); animateView();
@@ -814,11 +940,19 @@ async function selectSession(id: string, { engineId = state.engine, route = true
     }
     if (!cached) subscribe(view);
   } catch (err) { if (view === state.view && errorName(err) !== 'AbortError') notify(`${t('读取失败：')}${messageOf(err)}`); }
-  finally { if (view === state.view) { state.loading = false; state.refreshing = false; markCurrentRead(); renderDock(); renderHeader(); renderSessionList(); renderConversation(); } }
+  finally { if (view === state.view) { state.loading = false; state.refreshing = false; renderDock(); renderHeader(); renderSessionList(); renderConversation(); } }
 }
 function historyPush(route: string): void { window.history.pushState(null, '', route); }
-function switchEngine(id: string, { restore = true, route = true } = {}): Promise<void> | void {
+async function switchEngine(id: string, { restore = true, route = true, keepCoordinator = false } = {}): Promise<void> {
   if (!engine(id)) return;
+  let loadingLists: Promise<void> | undefined;
+  if (coordinatorMode && !keepCoordinator) {
+    rememberView();
+    setCoordinatorMode(false);
+    state.session = null; state.engine = '';
+    connectOverview(); void loadUsage();
+    loadingLists = loadLists();
+  }
   // Coming back to an engine reopens a chat from the mode its sidebar shows, as the desktop would.
   const spaces = spacesOf(engine(id)), pool = inSpace(state.sessions[id] || [], spaces, spaceId(id));
   let preferred = restore ? preferredSession(id, pool, state.lastSessions[id], state.activity, markers) : null;
@@ -830,6 +964,11 @@ function switchEngine(id: string, { restore = true, route = true } = {}): Promis
   renderedTurns = new Map(); $('timeline').replaceWith(Object.assign(document.createElement('div'), { id: 'timeline', className: 'timeline' }));
   restoreDraft(); renderHeader(); renderDock(); renderSessionList(); renderConversation(); animateView();
   if (route) historyPush(`#${encodeURIComponent(id)}`);
+  if (restore && loadingLists) {
+    const view = state.view;
+    await loadingLists;
+    if (view === state.view && !state.session && !$('prompt').value.trim()) await switchEngine(id, { route: false });
+  }
 }
 async function sendMessage(event?: Event | null, queue = false): Promise<void> {
   event?.preventDefault();
@@ -872,7 +1011,7 @@ async function sendFirst() {
   }
   cancelDictation(); saveDraft();
   const originalInput = $('prompt').value, prompt = originalInput.trim(), attachments = [...state.attachments], chosen = options();
-  const direct = !!capsOf().createRequiresPrompt;
+  const direct = coordinatorMode || !!capsOf().createRequiresPrompt;
   if (direct && !prompt && !attachments.length) return notify(t('请先输入第一条消息'));
   // With desktop-side choices (newOptions) the desktop's page says where the chat goes.
   // A chat started from a project's "+" also names that folder, so the desktop checks it is picked.
@@ -886,16 +1025,18 @@ async function sendFirst() {
     const where = mode ? { space: mode, ...(inProject ? { projectId: inProject.id } : {}) } : {};
     // What the cards show as chosen goes with the message: the desktop checks its page against it.
     const expect = !mode && capsOf().newOptions && newOptions.engine === provider.id ? newOptions.expect() : [];
-    session = await request<CreateResult & { title?: string; metadata?: SessionMetadata }>(`/api/sessions/${encodeURIComponent(provider.id)}`, { method: 'POST', body: JSON.stringify({ cwd, ...chosen, ...where, ...(expect.length ? { expect } : {}), ...(direct ? { prompt, attachments } : { title: title || undefined }) }) });
+    const url = coordinatorMode ? `${coordinatorUrl(provider.id)}/session` : `/api/sessions/${encodeURIComponent(provider.id)}`;
+    session = await request<CreateResult & { title?: string; metadata?: SessionMetadata }>(url, { method: 'POST', body: JSON.stringify({ cwd, ...chosen, ...where, ...(expect.length ? { expect } : {}), ...(direct ? { prompt, attachments } : { title: title || undefined }) }) });
     const group = mode ? (inProject ? { id: inProject.id, name: inProject.name, cwd: '' } : null) : target?.project ? { id: target.project.id, name: target.project.name, cwd: target.project.cwd } : aimed?.id ? { id: aimed.id, name: aimed.name ?? '', cwd: aimed.cwd } : capsOf().cwd && !capsOf().newOptions ? null : undefined;
     newProject = null;
     newOptions.sent();
-    (state.sessions[provider.id] ||= []).unshift({ ...session, title: session.title || title || t('新建聊天'), updatedAt: new Date().toISOString(), cwd: session.cwd || cwd || '', engine: provider.id, metadata: { ...session.metadata, ...(mode ? { space: mode } : {}), ...(group === undefined ? {} : { group }) } });
+    if (!url.startsWith('/api/coordinator/')) (state.sessions[provider.id] ||= []).unshift({ ...session, title: session.title || title || t('新建聊天'), updatedAt: new Date().toISOString(), cwd: session.cwd || cwd || '', engine: provider.id, metadata: { ...session.metadata, ...(mode ? { space: mode } : {}), ...(group === undefined ? {} : { group }) } });
     drafts.clearSent(owner, originalInput, attachments);
     noteFocusOnce('new');
     if (view === state.view) {
       $('prompt').value = ''; $('prompt').style.height = ''; state.attachments = []; saveDraft();
-      await selectSession(session.id, { engineId: provider.id });
+      if (coordinatorView && coordinatorMode) coordinatorView.sessionId = session.id;
+      await selectSession(session.id, { engineId: provider.id, route: !coordinatorMode });
       // What was picked for the first message stays picked in the new chat.
       for (const [id, value] of [['model', chosen.model], ['effort', chosen.reasoningEffort], ['permission', chosen.permissionMode]] satisfies Array<[Menu, string | undefined]>) if (value && [...$(id).options].some(option => option.value === value)) { $(id).value = value; $(id).dispatchEvent(new Event('change', { bubbles: true })); }
     } else renderSessionList();
@@ -904,7 +1045,7 @@ async function sendFirst() {
     notify(session ? `${t('聊天已建好，但第一条消息没发出去：')}${messageOf(err)}` : `${t('新建聊天失败：')}${messageOf(err)}`);
     // The desktop's page may not be what the cards show any more: read it again.
     if (!session && capsOf().newOptions && newOptions.engine === provider.id) void newOptions.refresh();
-    if (view === state.view || state.session?.id === session?.id) { if (!$('prompt').value) { $('prompt').value = originalInput; $('prompt').dispatchEvent(new Event('input')); } }
+    if (view === state.view || (session && state.session?.id === session.id)) { if (!$('prompt').value) { $('prompt').value = originalInput; $('prompt').dispatchEvent(new Event('input')); } }
   } finally { state.creating = false; sending.delete(owner); renderControls(); }
 }
 // Which speech-to-text the microphone will use for the chat on screen: the first agent service
@@ -1037,15 +1178,297 @@ function showInfo() {
   $('info-content').innerHTML = session ? `<dl><dt>${t('引擎')}</dt><dd>${escape(engine()?.label)}</dd><dt>${t('会话 ID')}</dt><dd>${escape(session.id)}</dd><dt>${t('工作目录')}</dt><dd>${escape(session.cwd || t('由桌面端管理'))}</dd><dt>${t('模型')}</dt><dd>${escape(session.metadata?.modelId || session.metadata?.model || t('桌面端默认模型'))}</dd>${session.metadata?.desktop?.model ? `<dt>${t('Web 端沿用的桌面设置')}</dt><dd>${escape([session.metadata.desktop.model, session.metadata.desktop.effort && `${t('推理')} ${session.metadata.desktop.effort}`, session.metadata.desktop.permissionMode && `${t('权限')} ${session.metadata.desktop.permissionMode}`].filter(Boolean).join(' · '))}${session.metadata.desktop.inherited ? t('（取自最近使用的桌面会话）') : ''}</dd>` : ''}<dt>${t('桌面端')}</dt><dd>${session.isDesktopActive ? t('活跃') : t('历史会话')}</dd></dl>` : ("<p>" + t('选择会话后查看工作目录与模型信息') + "</p>");
   $('info-dialog').showModal();
 }
+const coordinatorUrl = (id: string) => `/api/coordinator/${encodeURIComponent(id)}`;
+const coordinatorStates: Record<string, string> = {
+  queued: '等待投递', sent: '等待目标回复', 'waiting-user': '等待用户操作',
+  'return-queued': '等待回传总控', 'return-sent': '正在确认回传', confirming: '正在确认桌面记录', done: '已回传总控', linked: '已登记',
+  'not-sent': '消息未发出', 'return-failed': '回传未发出',
+};
+function coordinatorState(task: CoordinatorTaskSummary) {
+  if (task.state === 'sent' && !task.nativeTurn) return '正在确认桌面记录';
+  if (task.state === 'done') {
+    if (task.outcome === 'failed') return '目标执行失败';
+    if (task.outcome === 'interrupted') return '目标已停止';
+    if (task.followUp === false) return '目标已完成';
+  }
+  return coordinatorStates[task.state] || task.state;
+}
+const rememberChatsPrompt = '帮我记住与【项目、话题或任务】有关的会话。按每个会话正在做的事记一句说明，以后有相关任务就接着在原会话里做。拿不准是哪个会话时先问我。';
+const coordinatorActions = [
+  { id: 'find', icon: 'search', title: '找会话', detail: '按项目、关键词或时间定位', prompt: '帮我找今天在处理【任务关键词】的会话。给出候选的标题和项目。' },
+  { id: 'review', icon: 'file-text', title: '看进展', detail: '读相关会话，汇总进度和卡点', prompt: '找出【项目名】下的相关会话，汇总它们的进展、卡点和待确认事项。' },
+  { id: 'route', icon: 'messages-square', title: '协调工作', detail: '分派任务，等结果后接着跟进', prompt: '让之前处理【事项】的会话继续做【下一步】。如果有多个会话符合，先让我选。' },
+];
+function coordinatorWelcome(): string {
+  return `<section class="empty-conversation coordinator-welcome">
+    <img src="/assets/logo/logo-128.png" width="52" height="52" alt="">
+    <h2>${t('你要协调什么任务？')}</h2>
+    <p>${t('给一个项目名或关键词，总控会去相关 Agent 的会话里找。')}</p>
+    <div class="coordinator-actions">${coordinatorActions.map(action => `<button type="button" data-coordinator-example="${action.id}"${coordinatorView ? '' : ' disabled'}>
+      ${icon(action.icon)}<span><strong>${t(action.title)}</strong><small>${t(action.detail)}</small></span>
+    </button>`).join('')}</div>
+  </section>`;
+}
+const groups = new GroupPanel($('group-panel'), $('coordinator-pane'), () => state.engine,
+  () => state.engines, id => {
+    historyPush('#group/' + encodeURIComponent(id));
+    void followRoute();
+  }, () => void openCoordinator(state.engine), () => sidebar(true), hash => {
+    if (location.hash !== hash) historyPush(hash);
+    void followRoute();
+  });
+
+function setCoordinatorMode(enabled: boolean) {
+  if (!enabled) groups.close();
+  coordinatorMode = enabled;
+  if (!enabled) {
+    coordinatorView = null; coordinatorLoad++;
+    if (find($('coordinator-pane'), '[data-coordinator-engine][aria-expanded="true"]')) closeMenu();
+  }
+  document.documentElement.toggleAttribute('data-coordinator', enabled);
+  $('open-coordinator').setAttribute('aria-pressed', String(enabled));
+  $('coordinator-pane').hidden = !enabled;
+}
+function renderCoordinator() {
+  const view = coordinatorView;
+  const pane = $('coordinator-pane'), provider = engine();
+  const choices = controllers.filter(item => item.controller && engine(item.id));
+  const select = `<section class="coordinator-engine">
+    <div class="coordinator-mobile-heading mobile-only">
+      <button type="button" class="icon-button" data-coordinator-close aria-label="${t('关闭侧栏')}">${icon('panel-left-close')}</button>
+    </div>
+    <button type="button" class="coordinator-engine-card" aria-label="${t('切换总控引擎')}" aria-describedby="coordinator-current-engine" aria-haspopup="listbox" aria-expanded="false" data-for="coordinator-engine" data-coordinator-engine="${escape(provider?.id)}">
+      ${provider ? `<span class="coordinator-agent-face" aria-hidden="true">${character(provider)}</span>` : ''}
+      <span class="coordinator-pick">
+        <span class="coordinator-selected-name" id="coordinator-current-engine">${escape(provider?.label || t('请选择总控引擎'))}</span>
+        ${view?.sessionId ? `<span class="coordinator-connected">${t('已绑定会话')}</span>` : ''}
+      </span>
+      ${icon('chevron-down')}
+    </button>
+  </section>`;
+  const status = view?.desktopSetup && !view.pending ? '首次连接桌面'
+    : view?.desktopSetup ? '等待桌面初始化' : '正在确认总控会话';
+  const setup = view && (view.desktopSetup || view.recovering) ? `<section class="coordinator-setup">
+    <div class="coordinator-setup-title">${icon(view.recovering ? 'refresh-cw' : 'app-window')}<h3>${t(status)}</h3></div>
+    ${view.desktopSetup || view.canReset ? `<p>${t(view.desktopSetup && !view.pending ? '在桌面发送一次初始化草稿，之后可在这里直接发任务。' : view.desktopSetup ? '发送草稿后，工作台会核对会话和项目目录。' : '请先到桌面确认首条消息是否已发送。')}</p>` : ''}
+    ${view.desktopSetup && !view.candidates.length ? `<button type="button" class="primary-button" data-coordinator-prepare>${t(view.pending ? '重新打开桌面草稿' : '打开桌面初始化草稿')}${icon('arrow-up-right')}</button>` : ''}
+    ${view.recovering ? `<div class="coordinator-setup-links"><button type="button" data-coordinator-reload>${t('重新检查')}</button>${view.canReset ? `<button type="button" data-coordinator-reset>${t('重新准备')}</button>` : ''}</div>` : ''}
+  </section>` : '';
+  const candidates = (view?.candidates || []).map(item => `<button type="button" class="new-chat" data-coordinator-bind="${escape(item.id)}" title="${escape(item.cwd)}">${escape(item.title)} · ${escape(relativeTime(item.updatedAt))}</button>`).join('');
+  const sessions = coordinatorTargets(view?.tasks || []).map(task => {
+    const worker = engine(task.engine);
+    const known = state.sessions[task.engine]?.find(item => item.id === task.target);
+    const title = known?.title || task.title || t('未命名会话');
+    const workerName = worker?.label || task.engine;
+    const description = task.purpose ? `${title} · ${task.purpose}` : title;
+    const subtitle = [workerName, task.role ? title : null, task.purpose].filter(Boolean).join(' · ');
+    const row = `<span class="coordinator-worker-face" aria-hidden="true">${character(worker)}</span>
+      <span class="coordinator-task-target"><strong title="${escape(description)}">${escape(task.role || title)}</strong><small>${escape(subtitle)}</small></span>
+      <span class="coordinator-task-state" data-state="${escape(task.state)}" data-outcome="${escape(task.outcome || '')}"${task.error ? ` title="${escape(say(task.error))}"` : ''}>${t(coordinatorState(task))}</span>`;
+    const href = `#${encodeURIComponent(task.engine)}/${encodeURIComponent(task.target)}`;
+    return `<li>${worker ? `<a class="coordinator-task" href="${escape(href)}" data-coordinator-session>${row}</a>` : `<div class="coordinator-task">${row}</div>`}</li>`;
+  }).join('');
+  const location = find(pane, '.coordinator-location', HTMLDetailsElement);
+  const expanded = location?.open;
+  const trigger = find(pane, '[data-coordinator-engine]', HTMLButtonElement);
+  const triggerFocused = trigger && document.activeElement === trigger;
+  const groupDirectory = `<section data-group-directory><div class="coordinator-session-heading group-directory-heading">
+    <h2>${t('群聊')}</h2><button type="button" data-group-create>${icon('plus')}${t('新建群聊')}</button></div></section>`;
+  setHTML(pane, choices.length
+    ? `${select}${view ? setup + candidates : ''}${groupDirectory}${view ? `
+      <section><div class="coordinator-session-heading"><h2>${t('协作会话')}</h2>
+        ${view.sessionId ? `<button type="button" data-coordinator-remember>${t('记住会话')}</button>` : ''}</div>
+        ${sessions ? `<ul class="coordinator-tasks">${sessions}</ul>` : `<div class="coordinator-empty">${icon('messages-square')}<p>${t('这里会显示你让总控记住的会话，以及它派过任务的会话。')}</p></div>`}</section>
+      <div class="coordinator-footer">
+        <button type="button" class="coordinator-channel" data-coordinator-weixin aria-haspopup="dialog">${icon('messages-square')}<span>${t('微信')}</span>${icon('chevron-right')}</button>
+        <details class="coordinator-location"><summary>${icon('folder-open')}<span>${t('工作目录')}</span>${icon('chevron-right')}</summary><p class="coordinator-path">${escape(view.cwd)}</p></details>
+      </div>` : ''}`
+    : `<p>${t('没有可用的总控引擎')}</p>`);
+  if (trigger && !trigger.isConnected) {
+    const next = find(pane, '[data-coordinator-engine]', HTMLButtonElement);
+    if (trigger.getAttribute('aria-expanded') === 'true') {
+      if (next && next.dataset['coordinatorEngine'] === trigger.dataset['coordinatorEngine']) {
+        trigger.innerHTML = next.innerHTML;
+        next.replaceWith(trigger);
+      } else closeMenu();
+    }
+    if (triggerFocused) find(pane, '[data-coordinator-engine]', HTMLButtonElement)?.focus({ preventScroll: true });
+  }
+  if (expanded) find(pane, '.coordinator-location', HTMLDetailsElement)?.setAttribute('open', '');
+  groups.mount();
+  hydrateIcons(pane);
+}
+async function openCoordinator(preferred?: string, route = true, directoryOnly = false) {
+  groups.close();
+  const saved = savedCoordinator();
+  const previousEngine = state.engine;
+  if (!coordinatorMode) {
+    rememberView(); state.controller?.abort(); closeStream(); ++state.view;
+    state.engine = ''; state.session = null;
+    setCoordinatorMode(true); connectOverview();
+  }
+  const version = ++coordinatorLoad;
+  try {
+    controllers = await request<typeof controllers>('/api/coordinator');
+    if (version !== coordinatorLoad) return;
+    const choices = controllers.filter(item => item.controller && engine(item.id));
+    const available = new Set(choices.map(item => item.id));
+    const id = [preferred, saved, previousEngine, ...state.engines.map(item => item.id)].find(item => item && available.has(item)) || '';
+    if (id) try { storageFor('localStorage')?.setItem(coordinatorPreference, id); } catch {}
+    renderCoordinatorQuota(); placeDock();
+    if (id) void loadCoordinatorUsage();
+    if (route) {
+      const hash = id ? `#coordinator/${encodeURIComponent(id)}` : '#coordinator';
+      if (location.hash !== hash) historyPush(hash);
+    }
+    if (id !== state.engine && id) {
+      coordinatorView = null;
+      await switchEngine(id, { restore: false, route: false, keepCoordinator: true });
+    }
+    if (version !== coordinatorLoad) return;
+    renderCoordinator(); renderHeader(); renderControls();
+    if (!id || directoryOnly) { renderConversation(); return; }
+    const view = await request<CoordinatorView>(`${coordinatorUrl(id)}/open`, { method: 'POST' });
+    if (version !== coordinatorLoad) return;
+    coordinatorView = view;
+    renderCoordinator(); renderHeader(); renderControls();
+    if (!view.sessionId && !state.session) renderConversation();
+    void request<Model[]>(`${coordinatorUrl(id)}/models`).then(models => {
+      if (version !== coordinatorLoad) return;
+      state.models[id] = models;
+      renderModels(); renderControls();
+    }, () => {});
+    if (view.sessionId) {
+      if (!state.session && state.engine === id && $('prompt').value.trim()) {
+        saveDraft();
+        const key = viewKey(id, view.sessionId);
+        if (!drafts.get(key).text) drafts.set(key, drafts.get(currentKey()));
+      }
+      await selectSession(view.sessionId, { engineId: id, route: false });
+    }
+  } catch (err) { if (version === coordinatorLoad) { renderCoordinator(); notify(messageOf(err)); } }
+}
+let refreshingCoordinator = false;
+async function refreshCoordinatorTasks() {
+  if (!coordinatorMode || !coordinatorView || document.hidden || refreshingCoordinator) return;
+  refreshingCoordinator = true;
+  const view = coordinatorView;
+  try {
+    if (view.desktopSetup && view.pending && !view.candidates.length) {
+      const latest = await request<CoordinatorView>(`${coordinatorUrl(view.engine)}/open`, { method: 'POST' });
+      if (coordinatorView !== view) return;
+      if (latest.sessionId) await openCoordinator(view.engine);
+      else if (latest.candidates.length) { coordinatorView = latest; renderCoordinator(); }
+      return;
+    }
+    const tasks = await request<CoordinatorView['tasks']>(`${coordinatorUrl(view.engine)}/tasks`);
+    if (coordinatorMode && coordinatorView === view && JSON.stringify(view.tasks) !== JSON.stringify(tasks)) {
+      view.tasks = tasks; renderCoordinator(); scheduleRender();
+    }
+  } catch { /* The task list refreshes again when the server is reachable. */ }
+  finally { refreshingCoordinator = false; }
+}
+function fillCoordinatorPrompt(prompt: string) {
+  if (!coordinatorMode || $('prompt').disabled) return;
+  const field = $('prompt');
+  if (!field.value) field.value = t(prompt);
+  else field.setRangeText(t(prompt), field.selectionStart, field.selectionEnd, 'end');
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  field.focus();
+}
+$('open-coordinator').addEventListener('click', () => void openCoordinator());
+const refreshCoordinatorQuota = () => { renderCoordinatorQuota(); placeDock(); void loadCoordinatorUsage(); };
+$('open-coordinator').addEventListener('pointerenter', refreshCoordinatorQuota);
+$('open-coordinator').addEventListener('focus', refreshCoordinatorQuota);
+function showCoordinatorEngines(button: HTMLButtonElement): void {
+  const choices = state.engines.filter(item => controllers.some(agent => agent.id === item.id && agent.controller));
+  showMenu(button, choices.map(item => ({ value: item.id, label: item.label, selected: item.id === state.engine, provider: item })), {
+    label: t('切换总控引擎'),
+    icon: item => {
+      const face = document.createElement('span');
+      face.className = 'coordinator-menu-face';
+      face.innerHTML = character(item.provider);
+      return face;
+    },
+    onPick: item => { if (item.value !== state.engine) void openCoordinator(item.value); },
+  });
+}
+$('coordinator-pane').addEventListener('keydown', event => {
+  const button = closest(event.target, '[data-coordinator-engine]', HTMLButtonElement);
+  if (button && ['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); showCoordinatorEngines(button); }
+});
+$('coordinator-pane').addEventListener('click', async event => {
+  const choice = closest(event.target, '[data-coordinator-engine]', HTMLButtonElement);
+  if (choice) return showCoordinatorEngines(choice);
+  if (closest(event.target, '[data-coordinator-remember]')) return fillCoordinatorPrompt(rememberChatsPrompt);
+  if (closest(event.target, '[data-coordinator-weixin]') && coordinatorView) {
+    closeMenu();
+    openWeixin(coordinatorView.engine, coordinatorView.sessionId || '');
+    return;
+  }
+  if (closest(event.target, '[data-coordinator-close]')) { closeMenu(); sidebar(false); return; }
+  const session = closest(event.target, '[data-coordinator-session]', HTMLAnchorElement);
+  if (session && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+    event.preventDefault(); historyPush(session.hash); return followRoute();
+  }
+  if (closest(event.target, '[data-coordinator-reload]')) return openCoordinator(state.engine);
+  const prepare = closest(event.target, '[data-coordinator-prepare]', HTMLButtonElement);
+  const reset = closest(event.target, '[data-coordinator-reset]', HTMLButtonElement);
+  const bind = closest(event.target, '[data-coordinator-bind]');
+  if ((!bind && !prepare && !reset) || !coordinatorView) return;
+  const { engine: id } = coordinatorView;
+  if (reset && !window.confirm(t('已在桌面核对，并确认要放弃本次初始化？'))) return;
+  const action = prepare || reset;
+  if (action) action.disabled = true;
+  try {
+    if (action) await request(`${coordinatorUrl(id)}/${prepare ? 'prepare' : 'reset'}`, { method: 'POST' });
+    else if (bind) await request(`${coordinatorUrl(id)}/session/${encodeURIComponent(data(bind, 'coordinatorBind'))}`, { method: 'PUT' });
+    if (coordinatorMode && state.engine === id) await openCoordinator(id);
+  } catch (err) { notify(messageOf(err)); }
+  finally { if (action) action.disabled = false; }
+});
+$('conversation').addEventListener('click', event => {
+  const button = closest(event.target, '[data-coordinator-example]');
+  const example = coordinatorActions.find(item => item.id === button?.dataset['coordinatorExample']);
+  if (example) fillCoordinatorPrompt(example.prompt);
+});
 async function followRoute() {
-  let provider, session;
-  try { [provider, session] = location.hash.slice(1).split('/').map(decodeURIComponent); } catch { return; }
+  let provider, session, turnId;
+  const hash = location.hash;
+  try { [provider, session, turnId] = location.hash.slice(1).split('/').map(decodeURIComponent); } catch { return; }
+  if (provider === 'group' && session) {
+    if (!coordinatorMode || !state.engine) await openCoordinator(undefined, false, true);
+    if (location.hash === hash) await groups.open(session, turnId);
+    return;
+  }
+  groups.close();
+  if (provider === 'coordinator') return openCoordinator(session, false);
+  if (coordinatorMode && provider && engine(provider) && session) {
+    await switchEngine(provider, { restore: false, route: false });
+  }
   if (provider && engine(provider)) {
-    if (session) await selectSession(session, { engineId: provider, route: false });
+    if (session) {
+      await selectSession(session, { engineId: provider, route: false });
+      if (turnId && location.hash === hash && state.session?.id === session) {
+        const turn = state.store.turns.find(item => item.id === turnId || item.nativeTurnId === turnId);
+        const node = turn?.id && find($('timeline'), `[data-turn="${CSS.escape(turn.id)}"]`);
+        if (node) { state.follow = false; node.scrollIntoView({ block: 'start' }); }
+      }
+    }
     else await switchEngine(provider, { route: false });
   } else await switchEngine(state.engine);
 }
-$('engine-dock').addEventListener('click', event => { const button = closest(event.target, '[data-engine]'); if (button) switchEngine(data(button, 'engine')); });
+$('engine-dock').addEventListener('click', async event => {
+  const button = closest(event.target, '[data-engine]');
+  if (!button) return;
+  const id = data(button, 'engine');
+  if (closest(event.target, '[data-show-waiting]')) {
+    sidePrefs.setView(id, 'waiting');
+    $('session-search').value = '';
+    if (id !== state.engine || coordinatorMode) await switchEngine(id, { restore: false });
+    renderSessionList(); sidebar(true);
+  } else switchEngine(id);
+});
 $('session-search').addEventListener('input', renderSessionList);
 // The mode switch is a menu, as the desktops' own: picking a mode shows its projects and chats;
 // the open chat stays open only if it is in that mode.
@@ -1066,7 +1489,22 @@ $('space-switch').addEventListener('keydown', event => {
   if (!['ArrowDown', 'ArrowUp'].includes(event.key) || !closest(event.target, '[data-space-menu]')) return;
   event.preventDefault(); closest(event.target, '[data-space-menu]')?.click();
 });
+function pickSidebarView(view: SidebarView) {
+  sidePrefs.setView(state.engine, view);
+  renderSessionList();
+}
+$('sidebar-view').addEventListener('click', () => {
+  const button = $('sidebar-view');
+  const items = (Object.keys(sidebarViews) as SidebarView[]).map(value => ({
+    value, label: t(sidebarViews[value]), selected: value === sidePrefs.view(state.engine),
+  }));
+  showMenu(button, items, { label: t('列表显示'), onPick: item => pickSidebarView(item.value) });
+});
+$('sidebar-view').addEventListener('keydown', event => {
+  if (['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); $('sidebar-view').click(); }
+});
 $('session-list').addEventListener('click', event => {
+  if (closest(event.target, '[data-view-unread]')) { pickSidebarView('unread'); $('sidebar-view').focus(); return; }
   const toggle = closest(event.target, '[data-project-toggle]'), more = closest(event.target, '[data-side-more]'), button = closest(event.target, '[data-session]'), plus = closest(event.target, '[data-project-new]');
   if (plus) newChat({ id: data(plus, 'projectNew'), name: plus.closest('.side-project')?.querySelector('.side-label')?.textContent || '', cwd: plus.dataset['cwd'] });
   else if (toggle) { sidePrefs.toggle(state.engine, data(toggle, 'projectToggle')); renderSessionList(); }
@@ -1381,13 +1819,42 @@ $('image-viewer').addEventListener('click', event => { if (!closest(event.target
 $('close-image-viewer').addEventListener('click', () => $('image-viewer').close());
 $('image-viewer').addEventListener('close', () => { $('image-viewer-img').removeAttribute('src'); });
 $('jump-bottom').addEventListener('click', () => { state.follow = true; $('conversation').scrollTop = $('conversation').scrollHeight; $('jump-bottom').hidden = true; });
+const approvalUrl = (id: string) => `${endpoint()}/approvals/${encodeURIComponent(id)}`;
+$('conversation').addEventListener('input', event => {
+  const field = closest(event.target, 'form[data-approval-form] textarea', HTMLTextAreaElement);
+  if (!field?.value.trim()) return;
+  const option = field.closest('fieldset')?.querySelector<HTMLInputElement>('input:checked');
+  if (option) option.checked = false;
+});
+$('conversation').addEventListener('change', event => {
+  const field = closest(event.target, 'form[data-approval-form] input[type="radio"]', HTMLInputElement);
+  const other = field?.closest('fieldset')?.querySelector('textarea');
+  if (other) other.value = '';
+});
+$('conversation').addEventListener('submit', async event => {
+  const form = closest(event.target, 'form[data-approval-form]', HTMLFormElement);
+  if (!form) return;
+  event.preventDefault();
+  if (form.hasAttribute('aria-busy')) return;
+  const values = new FormData(form);
+  const answers = Object.fromEntries(findAll(form, '[data-question]').flatMap((field, index) => {
+    const answer = str(values.get(`text${index}`))?.trim() || str(values.get(`option${index}`));
+    return answer ? [[field.dataset.question, answer]] : [];
+  }));
+  const decline = closest(event.submitter, 'button', HTMLButtonElement)?.value === 'decline';
+  if (!decline && !Object.keys(answers).length) { notify(t('请填写至少一项回答')); return; }
+  form.setAttribute('aria-busy', 'true');
+  try {
+    await request(approvalUrl(data(form, 'approvalForm')), { method: 'POST', body: JSON.stringify({ decision: decline ? 'decline' : { answers } }) });
+  } catch (err) { notify(messageOf(err)); form.removeAttribute('aria-busy'); }
+});
 $('conversation').addEventListener('click', async event => {
   const button = closest(event.target, 'button', HTMLButtonElement); if (!button) return;
   if (button.dataset.action === 'new-chat') newChat();
   if (button.hasAttribute('data-copy-path')) copy(data(button, 'copyPath'), button);
   if (button.dataset.copyTurn) copy(state.store.turns.find(turn => turn.id === button.dataset.copyTurn)?.messages.filter(item => item.phase !== 'commentary').map(item => item.text).join('\n\n') || '', button);
   if (button.dataset.approval && button.dataset.decision === 'desktop') { await showInDesktop(button); return; }
-  if (button.dataset.approval) { button.disabled = true; try { await request(`${endpoint()}/approvals/${encodeURIComponent(button.dataset.approval)}`, { method: 'POST', body: JSON.stringify({ decision: button.dataset.decision }) }); } catch (err) { notify(messageOf(err)); button.disabled = false; } }
+  if (button.dataset.approval) { button.disabled = true; try { await request(approvalUrl(button.dataset.approval), { method: 'POST', body: JSON.stringify({ decision: button.dataset.decision }) }); } catch (err) { notify(messageOf(err)); button.disabled = false; } }
 });
 // Only where some agent's sending works its desktop's window and takes the focus (Windows): elsewhere
 // no helper waits on the person's typing, so the page does not say it.
@@ -1412,7 +1879,8 @@ if (!/Mac|iPhone|iPad/.test(navigator.platform)) {
 window.addEventListener('popstate', followRoute);
 window.addEventListener('pageshow', event => { if (event.persisted) { connectOverview(); if (state.session) selectSession(state.session.id, { force: true, route: false }); loadUsage(); } });
 window.addEventListener('pagehide', () => { saveDraft(); closeStream(); state.overview?.close(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { markCurrentRead(); renderDock(); renderSessionList(); loadUsage(); refreshSoon(); void loadVoice(); } });
+window.addEventListener('storage', event => { if (event.key === markers.key) { markers.reload(); renderDock(); renderSessionList(); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { markCurrentRead(); void loadReadMarkers(); renderDock(); renderSessionList(); loadUsage(); refreshSoon(); void loadVoice(); } });
 matchMedia('(max-width:767px)').addEventListener('change', () => { document.body.classList.remove('sidebar-open', 'sidebar-hidden'); $('sidebar-scrim').hidden = true; $('workspace').inert = false; const bar = find(document, '.control-bar'); if (bar) bar.inert = false; $('sidebar').inert = matchMedia('(max-width:767px)').matches; });
 
 // The "+" after the dock: a prompt anyone can give their own desktop AI so it joins this
@@ -1467,7 +1935,7 @@ Please:
 1. Read the whole guide first, plus the philosophy, choosing channels, capability paths, plugin contract and acceptance checklist under references/, then docs/architecture.md. Write your plugin in TypeScript as src/server/plugins/<your engine id>.plugin.ts, exporting about (your name, colour and app icon, and a detect that only looks whether your desktop app is on this machine, with no side effects) and setup (run only when you are switched on, and able to release everything it started when you are switched off); your data adapter goes under src/server/. The shapes come from src/shared/contract.ts, and a wrong field fails the build. Model your work on the existing plugin most like you (Claude: everything through the accessibility helper; Codex: an official interface plus the window-to-window channel; Antigravity: everything through a local service). While you work, run npm run dev (page changes show at once, server changes restart it).
 2. Find out your data on this machine (read-only, change nothing): session records, project membership and order, the native evidence for "running" and "ended", each session's model / reasoning effort / permissions, what step lists and question cards look like in the record.
 3. Pick the channels and put them in a table in docs/skins/<your engine id>/progress.md: which route sending, steering, stopping, changing settings, new chats, answering cards, opening the chat in your desktop app and opening files each take, with evidence. Every one must meet three conditions: the turn is run by your desktop app's own process, your desktop app shows the message right away as my own, and no one else's token is used. Prefer an interface your desktop process exposes (like Codex's app-server queue or Antigravity's language server), then the channel between your desktop's own windows (like Codex's IPC), and only then the shared accessibility driver (like Claude), writing only your steps and control names, never the actions again; that driver is Swift on macOS and UI Automation (C#) on Windows, with your steps written once for each (<your engine id>-desktop.swift / .cs), and what to mind on Windows is in the guide's channels section. Never start a separate CLI process to run the turn; when a channel cannot do something, do not send, and say why (a steer that cannot join falls back to the queue).
-4. Build in the guide's stages: read-only and visible → sending and live updates → stop, steer, queue → settings follow the message → new chats → cards and files → looking like yourself. Open the page and look after each stage.
+4. Build in the guide's stages: read-only and visible → sending and live updates → stop, steer, queue → settings follow the message → new chats → cards and files → looking like yourself. Open the page and look after each stage. To support the coordinator, declare the optional coordinator adapter and test that discovering sessions does not read their transcripts.
 5. When I change the model / reasoning effort / permissions in Frontdesk, change it in your desktop app first, then send; if it cannot be changed, do not send. Do not add a read-only mode, and do not block sending because a session is running in the desktop app: I make sure I never write from both places at once.
 6. Do not read other programs' private tokens or keys; your own official CLI's sign-in credentials may be read on the server at the moment of use (for quota, say), but never in the page, logs, tests or files. Ask me first for anything that needs my authorization (macOS's Accessibility permission, for example). If your desktop app has its own speech-to-text, wire up dictate and dictationReady: the microphone gains one more source it can use.
 7. To look more like your desktop app, only fill in the plugin's look field and the kit's --kit-* variables, and register renderers for what only you have; do not copy the kit's styles or hard-code your name in shared code. Unless I explicitly ask for a one-to-one match, no screenshot comparison is needed.
@@ -1902,16 +2370,19 @@ async function init() {
   for (const id of ['model', 'effort', 'permission'] as const) enhanceSelect($(id));
   hydrateIcons(); renderControls();
   try {
-    const manifest = await request<EnginesResponse>('/api/engines');
+    const [manifest] = await Promise.all([request<EnginesResponse>('/api/engines'), loadReadMarkers()]);
     state.engines = manifest.engines; state.agents = manifest.agents || []; state.defaultCwd = manifest.defaultCwd; state.projectDir = manifest.projectDir || ''; state.fileManager = manifest.fileManager || ''; state.voice = manifest.dictation; state.httpsPort = manifest.httpsPort;
     enginesSeen = seenOf(manifest);
     try { chatKit = (await import('./kit/kit.js')).setup({ registerRenderer, newSettings, canPress: () => !!state.session && !!capsOf().cardActions, pressAction, readCard }); } catch (err) { console.error('Chat kit failed to load', err); }
     for (const item of state.engines) await loadSkin(item);
-    state.engine = state.engines[0]?.id || ''; state.ready = true;
+    const controllerRoute = /^#(?:coordinator|group)(?:\/|$)/.test(location.hash);
+    if (controllerRoute) setCoordinatorMode(true);
+    state.engine = controllerRoute ? '' : state.engines[0]?.id || ''; state.ready = true;
     restoreDraft(); renderDock(); renderHeader(); renderConversation(); connectOverview(); loadUsage(); sidebar(!matchMedia('(max-width:767px)').matches);
-    await loadLists();
+    if (!controllerRoute) await loadLists();
     restoreDraft(); renderHeader(); renderControls(); await followRoute();
     setInterval(loadUsage, 60000);
+    setInterval(refreshCoordinatorTasks, 3000);
   } catch (err) { notify(`${t('无法连接工作台：')}${messageOf(err)}`); $('timeline').innerHTML = ("<p class=\"quiet-state\">" + t('服务暂时不可用，恢复后刷新页面继续') + "</p>"); }
 }
 init();

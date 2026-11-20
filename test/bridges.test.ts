@@ -71,17 +71,24 @@ test('Codex: a reply the desktop is writing is shown as it grows, from the windo
   const { bridge, thread } = fakeCodex();
   bridge.followMs = 20;
   let live: ((state: LiveThread) => void) | undefined;
-  bridge.desktop = fake<CodexDesktopIpc>({ watch: (id, on) => { live = on; return { close() {} }; } });
+  let watches = 0;
+  const answers: unknown[] = [], cards: string[] = [];
+  bridge.desktop = fake<CodexDesktopIpc>({
+    watch: (_, on) => { watches++; live = on; return { close() {} }; },
+    answerUserInput: async input => { answers.push(input); },
+  });
+  const leavePage = bridge.watchSession('th', () => {});
   const emitter = bridge.startTurn({ threadId: 'th', prompt: 'tell a story' });
   const replies: Array<[string, unknown]> = [], shown: Array<[unknown, unknown]> = [];
   emitter.on('item_started', ({ item }) => replies.push(['writing', item.text]));
   emitter.on('item_completed', ({ item }) => { if (item.type === 'agentMessage') replies.push(['recorded', item.text]); });
   bindEvents(emitter, (type, data) => { if (type === 'message.updated') shown.push([get(data, 'status'), get(data, 'text')]); });
+  emitter.on('approval', card => cards.push(card.id));
   const done = settle(emitter);
   const until = async (check: () => boolean) => { for (let i = 0; i < 100 && !check(); i++) await new Promise(resolve => setTimeout(resolve, 10)); assert.ok(check()); };
   const desktop = (text: string, turnId = 't2') => must(live)({ requests: [], turns: [{ turnId, items: [{ id: 'u', type: 'userMessage' }, { id: 'm', type: 'agentMessage', text, phase: 'final_answer' }] }] });
   // Before the record names the turn, what the desktop writes is not known to be this run's.
-  await until(() => !!live);
+  await until(() => !!emitter.queuedId);
   desktop('Earlier');
   // The desktop takes the message: the record has the turn, without its reply.
   const turn: { id: string; status: string; completedAt?: number; items: object[] } = { id: 't2', status: 'inProgress', items: [{ id: 'u', type: 'userMessage', content: [{ type: 'text', text: 'tell a story' }] }] };
@@ -91,6 +98,14 @@ test('Codex: a reply the desktop is writing is shown as it grows, from the windo
   await until(() => replies.length === 1);
   desktop('Once up'); desktop('Once upon');
   await until(() => replies.length === 2);
+  const question = { id: 7, method: 'item/tool/requestUserInput', params: { threadId: 'th', turnId: 't2', questions: [{ id: 'ending', question: 'Ending?', options: [{ label: 'Happy' }] }] } };
+  must(live)({ turns: [], requests: [question, { ...question, id: 8, params: { ...question.params, turnId: 'other' } }] });
+  assert.deepEqual(cards, ['th:7']);
+  const answered = bridge.decide('th', 'th:7', 'option:Happy');
+  must(live)({ turns: [], requests: [] });
+  await answered;
+  assert.deepEqual(answers, [{ threadId: 'th', requestId: 7, response: { answers: { ending: { answers: ['Happy'] } } } }]);
+  assert.equal(watches, 1);
   // The record has the reply whole: what the desktop still holds is not shown over it.
   turn.items.push({ id: 'm', type: 'agentMessage', text: 'Once upon a time.', phase: 'final_answer' });
   Object.assign(turn, { status: 'completed', completedAt: 9 });
@@ -99,6 +114,7 @@ test('Codex: a reply the desktop is writing is shown as it grows, from the windo
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.deepEqual(replies, [['writing', 'Once'], ['writing', 'Once upon'], ['recorded', 'Once upon a time.']]);
   assert.deepEqual(shown, [['streaming', 'Once'], ['streaming', 'Once upon'], ['completed', 'Once upon a time.']]);
+  leavePage();
   emitter.emit('interrupt');
 });
 
@@ -389,6 +405,63 @@ function antigravityFixture(steps: object[], { idle = 1, inputIndex = 0, t }: { 
 const agyStep = (type: string, status: string, body: object = {}, meta: object = {}) => ({ type: `CORTEX_STEP_TYPE_${type}`, status: `CORTEX_STEP_STATUS_${status}`, metadata: { createdAt: '2026-11-11T17:02:07Z', ...meta }, ...body });
 const agyFatal = agyStep('ERROR_MESSAGE', 'DONE', { errorMessage: { shouldShowUser: true, error: { userErrorMessage: 'Agent execution terminated due to error.', shortError: 'unknown model key M8' } } });
 
+test('Antigravity displays a native quota limit live and after reload even when the transcript omitted it', async t => {
+  const message = 'Individual quota reached. Resets in 3h53m38s.';
+  const report = agyStep('ERROR_MESSAGE', 'DONE', {
+    errorMessage: { shouldShowUser: true, error: { errorCode: 429, userErrorMessage: message, shortError: 'RESOURCE_EXHAUSTED (code 429)' } },
+  });
+  const steps = [
+    agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'first task' } }),
+    report,
+    agyStep('SYSTEM_MESSAGE', 'DONE', {}),
+  ];
+  const { bridge, calls, dir } = antigravityFixture(steps, { idle: 0, t });
+  const file = bridge.transcriptPath('c1');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const prompt = (index: number) => JSON.stringify({ type: 'USER_INPUT', step_index: index, content: 'task' }) + '\n';
+  fs.writeFileSync(file, prompt(0));
+  const emitted = await new Promise<EngineCompleted>((resolve, reject) => {
+    const emitter = new EngineEvents();
+    const timeout = setTimeout(() => reject(new Error('Quota failure was not reported while native busy was set')), 1000);
+    t.after(() => clearTimeout(timeout));
+    emitter.on('completed', data => { clearTimeout(timeout); resolve(data); });
+    emitter.on('error', reject);
+    bridge.watchTurn('c1', emitter, { file, offset: fs.statSync(file).size });
+  });
+  assert.deepEqual(emitted.turn, { status: 'failed', error: { message } });
+  const first = __core_presentation.presentHistory(await bridge.getConversationHistory('c1'));
+  assert.equal(first.turns[0]?.error, message);
+  assert.equal(first.turns[0]?.status, 'failed');
+  const callsBefore = calls.length;
+  await bridge.getConversationHistory('c1');
+  assert.equal(calls.filter(call => call.method === 'GetCascadeTrajectorySteps').length, callsBefore);
+
+  steps.push(agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'second task' } }));
+  fs.appendFileSync(file, prompt(3));
+  const db = new __node_sqlite.DatabaseSync(path.join(dir, 'conversation_summaries.db'));
+  db.exec('UPDATE conversation_summaries SET step_count = 4, last_user_input_step_index = 3');
+  db.close();
+  const next = __core_presentation.presentHistory(await bridge.getConversationHistory('c1'));
+  assert.deepEqual(next.turns.map(turn => [turn.id, turn.error]), [['turn-0', message], ['turn-3', undefined]]);
+});
+
+test('Antigravity resolves the session model alias used by the coordinator before sending', async t => {
+  const { bridge, calls } = antigravityFixture([
+    agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'original question' } }),
+    agyStep('PLANNER_RESPONSE', 'DONE', { plannerResponse: { response: 'original answer' } }, { requestedModel: { model: 'flash-high' } }),
+  ], { t });
+  const { session } = await bridge.coordinationHistory('c1');
+  const model = session.metadata.desktop?.model;
+  assert.equal(model, 'flash-high');
+  await bridge.sendUserMessage(session.id, 'delegated follow-up', { model });
+  assert.deepEqual(dig(calls.find(call => call.method === 'SendUserCascadeMessage')?.body, 'cascadeConfig'), {
+    plannerConfig: { requestedModel: { model: 'MODEL_A' } },
+  });
+  assert.equal((await bridge.getConversationHistory(session.id)).session.metadata.model, 'Flash (High)');
+  await assert.rejects(bridge.sendUserMessage(session.id, 'cannot send', { model: 'retired-model' }), /没有提供这个模型/);
+  assert.equal(calls.filter(call => call.method === 'SendUserCascadeMessage').length, 1);
+});
+
 test('Antigravity reads a conversation without a transcript from the language server, and shows a turn an error ended as failed', async t => {
   const { bridge, dir } = antigravityFixture([
     agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'build it' } }),
@@ -514,9 +587,13 @@ test('what an Antigravity step waits on the person for becomes a card in the cha
   steps[1] = agyStep('RUN_COMMAND', 'DONE', {}, { toolCall: { id: 't' } });
   steps.push(waitingOn({ askQuestion: { questions: [{ question: 'Which one?', options: [{ id: 'a', text: 'Alpha' }, { id: 'b', text: 'Beta' }] }] } }));
   await until(() => cards.length === 2);
-  assert.deepEqual(at(cards, 1), { id: 'c1_2', title: 'Which one?', detail: '', decisions: [{ id: 'option:a', label: 'Alpha' }, { id: 'option:b', label: 'Beta' }, { id: 'decline', label: '跳过' }] });
-  await bridge.decide('c1_2', 'option:b');
+  assert.deepEqual(at(cards, 1), { id: 'c1_2', title: 'Which one?', kind: 'input', detail: '', decisions: [{ id: 'option:a', label: 'Alpha' }, { id: 'option:b', label: 'Beta' }, { id: 'decline', label: '跳过' }] });
+  assert.equal(at(await bridge.listConversations(), 0).metadata.waitingFor, 'input');
+  assert.equal((await bridge.getConversationHistory('c1')).turns.at(-1)?.approvals?.[0]?.id, 'c1_2');
+  await assert.rejects(bridge.decideNative('c1', 'c1_2', 'option:unknown'));
+  await bridge.decideNative('c1', 'c1_2', 'option:b');
   assert.deepEqual(dig(at(calls, -1).body, 'interaction', 'askQuestion', 'responses', 0, 'selectedOptionIds'), ['b']);
+  await assert.rejects(bridge.decideNative('c1', 'c1_2', 'option:b'));
   steps[2] = agyStep('RUN_COMMAND', 'DONE', {}, { toolCall: { id: 'q' } });
   steps.push(waitingOn({ permission: { resource: { action: 'write', target: '/w/a.txt' }, actionDescription: 'Write a file' } }));
   await until(() => cards.length === 3);

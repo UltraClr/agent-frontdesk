@@ -4,7 +4,7 @@ import { EngineEvents } from '../src/server/types.js';
 import { at, bridgeEvent, dig, fake, must, required } from './support.js';
 import { errorField, get, list } from '../src/shared/guards.js';
 import { loadConfig } from '../src/server/config.js';
-import type { CodexDesktopIpc, DesktopRequest, LiveThread } from '../src/server/codex-desktop.js';
+import type { CodexDesktopIpc, DesktopRequest, DesktopTurn } from '../src/server/codex-desktop.js';
 import type { AnyBridgeEvent, BridgeEventMap, BridgeEventType, Engine, History, RunTurn, UnifiedSession, UnifiedStep, UnifiedTurn } from '../src/shared/contract.js';
 import type { HubMessage } from '../src/server/core/event-hub.js';
 import { PluginHost } from '../src/server/core/plugin-host.js';
@@ -407,29 +407,110 @@ test('what Codex waits on the person for is a card, followed from the owning win
   // immer patches, as the owner sends them for its `requests`
   assert.deepEqual(applyPatches([{ id: 1 }], [{ op: 'add', path: [1], value: { id: 2 } }, { op: 'remove', path: [0] }]), [{ id: 2 }]);
   assert.deepEqual(applyPatches([{ id: 1 }, { id: 2 }], [{ op: 'replace', path: ['length'], value: 1 }]), [{ id: 1 }]);
-  const question = { id: 7, method: 'item/tool/requestUserInput', params: { threadId: 't', questions: [{ id: 'pick', question: 'Which?', options: [{ label: 'Alpha' }, { label: 'Beta' }] }] } };
+  const question = { id: 7, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'turn', questions: [{ id: 'pick', question: 'Which?', options: [{ label: 'Alpha' }, { label: 'Beta' }] }] } };
   assert.deepEqual(must(askCard('t', question)).decisions.map(item => get(item, 'id')), ['option:Alpha', 'option:Beta', 'decline']);
   assert.equal(askCard('t', { id: 8, method: 'item/commandExecution/requestApproval', params: { command: 'rm -rf build' } })?.detail, 'rm -rf build');
-  assert.equal(askCard('t', { id: 9, method: 'item/tool/requestOptionPicker', params: {} }), null);
+  assert.deepEqual(askCard('t', { id: 9, method: 'item/tool/requestOptionPicker', params: { threadId: 't' } })?.decisions, ['desktop']);
 
   const bridge = new CodexBridge({ codexBin: 'codex' }), calls: unknown[] = [];
-  let live: ((state: LiveThread) => void) | undefined;
-  bridge.desktop = fake<CodexDesktopIpc>({ watch: (id, on) => { live = on; return { close() { calls.push('closed'); } }; }, answerUserInput: async input => { calls.push(input); }, decideApproval: async input => { calls.push(input); } });
-  const push = (requests: DesktopRequest[]) => must(live)({ requests, turns: [] });
+  let push: ((requests: DesktopRequest[], turns: unknown[]) => void) | undefined;
+  bridge.desktop = fake<CodexDesktopIpc>({ watch: (id, on) => { push = (requests, turns) => on({ requests, turns }); return { close() { calls.push('closed'); } }; }, answerUserInput: async input => { calls.push(input); must(push)([], []); }, decideApproval: async input => { calls.push(input); must(push)([], []); } });
   const emitter = new EngineEvents(), seen: string[][] = [];
   emitter.on('approval', card => seen.push(['card', card.id])); emitter.on('approval_resolved', ({ id }) => seen.push(['gone', id]));
-  const asks = bridge.watchAsks('t', emitter);
-  push([question]); push([question]);
+  const asks = bridge.watchAsks('t', emitter, () => 'turn');
+  const stopBrowser = bridge.watchSession('t', () => {});
+  must(push)([question], []); must(push)([question], []);
   assert.deepEqual(seen, [['card', 't:7']]);
-  await bridge.decide('t:7', 'option:Beta');
+  await assert.rejects(bridge.decide('another-chat', 't:7', 'option:Beta'), /已经回答过了/);
+  await assert.rejects(bridge.decide('t', 't:7', 'option:missing'), /选项已失效/);
+  await bridge.decide('t', 't:7', 'option:Beta');
   assert.deepEqual(calls[0], { threadId: 't', requestId: 7, response: { answers: { pick: { answers: ['Beta'] } } } });
-  await assert.rejects(bridge.decide('t:7', 'option:Beta'), /已经回答过了/);
-  push([{ id: 8, method: 'item/fileChange/requestApproval', params: { reason: 'write' } }]);
-  assert.deepEqual(seen.slice(1), [['card', 't:8'], ['gone', 't:7']]);
-  await bridge.decide('t:8', 'accept');
+  await assert.rejects(bridge.decide('t', 't:7', 'option:Beta'), /已经回答过了/);
+  must(push)([{ id: 8, method: 'item/fileChange/requestApproval', params: { turnId: 'other-turn', reason: 'write' } }], []);
+  assert.deepEqual(seen.slice(1), [['gone', 't:7']], 'the native confirmation clears the card and the run only shows its own requests');
+  await bridge.decide('t', 't:8', 'accept');
   assert.deepEqual(calls[1], { threadId: 't', requestId: 8, kind: 'fileChange', decision: 'accept' });
   asks.close();
+  assert.notEqual(at(calls, -1), 'closed', 'the browser still follows the same chat');
+  stopBrowser();
   assert.equal(at(calls, -1), 'closed');
+});
+
+test('a desktop-started Codex chat renders the form and the proposed plan on their native turns', async () => {
+  const { CodexBridge } = __codex_bridge;
+  const bridge = new CodexBridge({ codexBin: 'codex' });
+  bridge.start = async () => {};
+  bridge.send = async () => ({ result: { thread: { id: 't', turns: [
+    { id: 'older', status: 'completed', completedAt: 100, items: [{ id: 'old-plan', type: 'plan', text: '## Earlier plan' }] },
+    { id: 'current', status: 'inProgress', startedAt: 200, items: [{ id: 'prompt', type: 'userMessage', content: [{ text: 'Plan a project' }] }] },
+  ] } } });
+  const form = { id: 1, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'current', questions: [
+    { id: 'scope', question: 'Which scope?', options: [{ label: 'API', description: 'Only the backend' }] },
+    { id: 'notes', question: 'Any constraints?', isOther: true },
+  ] } };
+  const implementation = { id: 'implement-plan:older', method: 'item/plan/requestImplementation', params: { threadId: 't', turnId: 'older', planContent: '## Earlier plan' } };
+  let push: ((requests: DesktopRequest[], turns: unknown[]) => void) | undefined;
+  const calls: unknown[] = [];
+  bridge.desktop = fake<CodexDesktopIpc>({ watch: (_, on) => { push = (requests, turns) => on({ requests, turns }); return { close() {} }; }, answerUserInput: async input => { calls.push(input); must(push)([implementation], []); } });
+  const release = bridge.watchSession('t', () => {});
+  const checklist = { id: 'checklist', type: 'todo-list', plan: [{ content: 'Review choices', status: 'in_progress' as const }] };
+  must(push)([implementation, form], [{ turnId: 'current', items: [{ ...checklist, plan: [{ step: 'Review choices', status: 'inProgress' }] }] }]);
+  const [older, current] = presentHistory(await bridge.getThread('t')).turns;
+  assert.deepEqual(older?.messages, [{ id: 'old-plan', phase: 'plan', text: '## Earlier plan' }]);
+  assert.deepEqual(older?.approvals?.map(item => item.decisions), [['desktop']]);
+  assert.equal(older?.status, 'completed');
+  assert.equal(current?.approvals?.[0]?.questions?.[1]?.freeform, true);
+  assert.deepEqual(current?.activities[0]?.plan, checklist.plan);
+  const host = new PluginHost(), hub = new EventHub(), service = new RunService(host, hub);
+  host.register({ ...provider('codex'), decideNative: (session, id, decision) => bridge.decide(session, id, decision) });
+  await assert.rejects(service.decide('codex', 't', 't:implement-plan:older', 'accept'), /选项已失效/);
+  await assert.rejects(service.decide('codex', 't', 't:1', { answers: { scope: 'unknown' } }), /选项已失效/);
+  await service.decide('codex', 't', 't:1', { answers: { scope: 'API', notes: ' Keep it local ' } });
+  assert.deepEqual(calls, [{ threadId: 't', requestId: 1, response: { answers: { scope: { answers: ['API'] }, notes: { answers: ['Keep it local'] } } } }]);
+  must(push)([], []);
+  assert.equal(presentHistory(await bridge.getThread('t')).turns.some(turn => turn.approvals), false);
+  release(); service.dispose();
+});
+
+test('Codex IPC projects requests and plans from canonical history, including patches', { timeout: 4000 }, async t => {
+  const net = __node_net, { frame, watch } = __codex_desktop;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-plans-')), sock = process.platform === 'win32' ? `\\\\.\\pipe\\frontdesk-test-${path.basename(dir)}` : path.join(dir, 's.sock');
+  const events = new __types.EngineEvents(), updates: { requests: DesktopRequest[]; turns: DesktopTurn[] }[] = [];
+  const sendState = (socket: import('node:net').Socket, change: unknown) => socket.write(frame({
+    type: 'broadcast', method: 'thread-stream-state-changed', sourceClientId: 'desktop',
+    params: { conversationId: 't', hostId: 'local', change },
+  }));
+  const request = { id: 1, method: 'item/tool/requestUserInput', params: { turnId: 'turn' } };
+  const server = net.createServer(socket => {
+    let buffer: Buffer = Buffer.alloc(0);
+    socket.on('data', (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4 && buffer.length >= 4 + buffer.readUInt32LE(0)) {
+        const end = 4 + buffer.readUInt32LE(0);
+        const message: unknown = JSON.parse(buffer.subarray(4, end).toString());
+        buffer = buffer.subarray(end);
+        if (get(message, 'method') === 'initialize') {
+          socket.write(frame({ type: 'response', requestId: get(message, 'requestId'), result: { clientId: 'follower' } }));
+        } else if (get(message, 'method') === 'thread-stream-following-changed' && get(message, 'params', 'following')) {
+          const items = [{ id: 'plan', type: 'plan', text: '## Draft' }, { id: 'todo', type: 'todo-list', plan: [{ step: 'Read docs', status: 'inProgress' }] }];
+          sendState(socket, { type: 'snapshot', revision: 1, conversationState: { requests: [request], turns: [], turnHistory: { kind: 'canonical', history: { entitiesByKey: { entity: { turnId: 'turn', items } } } } } });
+          sendState(socket, { type: 'patches', baseRevision: 1, revision: 2, patches: [
+            { op: 'remove', path: ['requests', 0] },
+            { op: 'replace', path: ['turnHistory', 'history', 'entitiesByKey', 'entity', 'items', 1, 'plan', 0, 'status'], value: 'completed' },
+          ] });
+        }
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(sock, resolve));
+  const watcher = watch('t', ({ requests, turns }) => { updates.push({ requests, turns: __codex_desktop.plansOf(turns) }); if (updates.length === 2) events.emit('interrupt'); }, { sock });
+  t.after(() => { watcher.close(); server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  await once(events, 'interrupt');
+  assert.deepEqual(updates[0]?.requests, [request]);
+  assert.deepEqual(updates[0]?.turns[0]?.planItems, [{ id: 'plan', type: 'plan', text: '## Draft' }]);
+  assert.equal(updates[0]?.turns[0]?.checklist?.plan[0]?.status, 'in_progress');
+  assert.deepEqual(updates[1]?.requests, []);
+  assert.equal(updates[1]?.turns[0]?.checklist?.plan[0]?.status, 'completed');
 });
 
 test('the window that owns a Codex thread is followed whole: its requests, and its turns with a reply as it is written', async t => {
@@ -464,15 +545,16 @@ test('the window that owns a Codex thread is followed whole: its requests, and i
   t.after(() => { server.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const seen: Array<[unknown, unknown[]]> = [];
   const watcher = watch('th', ({ requests, turns }) => seen.push([dig(turns.at(-1), 'items', 0, 'text'), requests.map(request => request.id)]), { sock, retryMs: 60000 });
-  for (let i = 0; i < 100 && seen.length < 3; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  for (let i = 0; i < 100 && seen.length < 4; i++) await new Promise(resolve => setTimeout(resolve, 10));
   await new Promise(resolve => setTimeout(resolve, 30));
   // Having missed a revision, it said it follows again and was given the state anew.
-  assert.deepEqual(seen, [['Once', []], ['Once upon', [7]], ['Once upon a time', []]]);
+  assert.deepEqual(seen, [['Once', []], ['Once upon', [7]], [undefined, []], ['Once upon a time', []]]);
   assert.deepEqual(following, [true, true]);
   watcher.close();
   for (let i = 0; i < 50 && following.at(-1) !== false; i++) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(following.at(-1), false);
 });
+
 test('every icon the page names in its sources is one it carries (the rest of lucide stays out of its script)', async () => {
   const { hasIcon } = await import('../src/client/js/icons.js');
   const client = path.resolve('src/client'), named = new Map<string, string>();
@@ -520,4 +602,34 @@ test('the Windows helper is compiled with the csc.exe Windows ships and speaks t
       assert.ok(list(checked['ported']).includes('chat-send'), 'the chat modes come with any flow');
     }
   }
+});
+
+test('Codex targets the waiting owner and keeps the card when an IPC success has no native confirmation', async () => {
+  const bridge = new __codex_bridge.CodexBridge({ codexBin: 'codex' });
+  bridge.approvalConfirmMs = 15;
+  let push: Parameters<NonNullable<CodexDesktopIpc['watch']>>[1] | undefined;
+  const requests = [{ id: 7, method: 'item/tool/requestUserInput', params: {
+    threadId: 't', turnId: 'native', questions: [{ id: 'one', question: 'Pick', options: [{ label: 'A' }] }],
+  } }];
+  let answerOwner: string | undefined;
+  bridge.desktop = fake<CodexDesktopIpc>({
+    watch: (_thread, callback) => { push = callback; return { close() {} }; },
+    answerUserInput: async (_input, options) => {
+      answerOwner = options?.targetClientId;
+      must(push)({ requests: [], turns: [], owner: null });
+      return { ok: true };
+    },
+  });
+  const emitter = new EngineEvents(), accepted: string[] = [];
+  emitter.on('approval_resolved', card => accepted.push(card.id));
+  const subscription = bridge.watchAsks('t', emitter);
+  try {
+    must(push)({ requests, turns: [], owner: 'window-a' });
+    await assert.rejects(bridge.decide('t', 't:7', 'option:A'), /尚未确认/);
+    assert.equal(answerOwner, 'window-a');
+    assert.deepEqual(accepted, [], 'a disconnect does not establish that the request was handled');
+    await assert.rejects(bridge.decide('t', 't:7', 'option:A'), /正在重新连接/);
+    must(push)({ requests: [], turns: [], owner: 'window-a' });
+    assert.deepEqual(accepted, ['t:7']);
+  } finally { subscription.close(); }
 });

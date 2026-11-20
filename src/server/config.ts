@@ -50,7 +50,7 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     exportsDir: env.BRIDGE_EXPORTS_DIR || path.join(ROOT, 'exports'),
     pluginDir: env.BRIDGE_PLUGIN_DIR || path.join(HERE, 'plugins'),
     defaultCwd: env.BRIDGE_DEFAULT_CWD || home,
-    codexBin: executable('CODEX_BIN', ['codex', bundledCodexCli()]),
+    codexBin: executable('CODEX_BIN', [bundledCodexCli(), 'codex']),
     claudeBin: executable('CLAUDE_BIN', ['claude', installedClaudeCli(), ...findClaude(path.join(claudeDesktop, 'claude-code'))]),
     codexHome: env.CODEX_HOME || path.join(home, '.codex'),
     claudeHome: env.CLAUDE_HOME || path.join(home, '.claude'),
@@ -61,6 +61,12 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     dictationEngine: env.BRIDGE_DICTATION_ENGINE || 'claude',
     // What the person chose in the console (which agents are on). Local to this checkout, not committed.
     settingsFile: env.BRIDGE_SETTINGS_FILE || path.join(ROOT, '.frontdesk.json'),
+    workbuddyHome: env.WORKBUDDY_HOME,
+    dshHome: env.DSH_HOME || path.join(home, '.dsh'),
+    dshBridgeFile: env.DSH_FRONTDESK_BRIDGE_FILE,
+    dshAppIcon: env.DSH_APP_ICON,
+    dshAppAsar: env.DSH_APP_ASAR,
+    coordinatorProfile: env.BRIDGE_COORDINATOR_PROFILE,
     agyHome, agentapiBin: env.AGENTAPI_BIN || agentapi?.[0] || null, agentapiArgs: env.AGENTAPI_BIN ? [] : agentapi?.[1] || [],
     catalogs,
   };

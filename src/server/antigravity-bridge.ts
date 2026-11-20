@@ -37,6 +37,7 @@ const MODEL_ALIASES: Model[] = [
 ];
 const NO_AGENTAPI = '未发现 agentapi，请确认已安装 Antigravity 或设置 AGENTAPI_BIN';
 const NO_LS = '未找到正在运行的 Antigravity。请打开 Antigravity 桌面端后重试。';
+const isPlannerModel = (value: string): boolean => /^MODEL_[A-Z0-9_]+$/.test(value);
 
 /** A transcript record, or one rewritten from the language server's steps: Antigravity's own fields. */
 export type AgRecord = { readonly [field: string]: unknown };
@@ -119,9 +120,38 @@ const stepStatus = (step: unknown): string => String(get(step, 'status') || '').
 const SETTLED = new Set(['DONE', 'ERROR', 'CANCELED', 'INTERRUPTED', 'INVALID', 'CLEARED']);
 // How often a running turn's steps are read from the language server.
 const REPLY_POLL_MS = 500;
+const NATIVE_LIMIT_LOOKBACK = 96;
 // Only an error the desktop shows the person counts; the rest are notes to the model, which retries.
 const shownError = (step: unknown): unknown => stepKind(step) === 'ERROR_MESSAGE' && get(step, 'errorMessage', 'shouldShowUser') ? get(step, 'errorMessage', 'error') || {} : null;
-const errorText = (error: unknown): string => [get(error, 'userErrorMessage'), get(error, 'shortError')].filter(Boolean).join(' ').trim() || 'Agent execution terminated due to error.';
+const quotaError = (error: unknown): boolean => Number(get(error, 'errorCode')) === 429 && get(error, 'isBenign') !== true;
+function errorText(error: unknown): string {
+  const shown = str(get(error, 'userErrorMessage'))?.trim();
+  if (shown && quotaError(error)) return shown;
+  return [shown, get(error, 'shortError')].filter(Boolean).join(' ').trim() || 'Agent execution terminated due to error.';
+}
+function recordFailure(turn: UnifiedTurn, record: AgRecord): void {
+  const detail = String(record.content || record.error || '').replace(/^Error:\s*/, '').slice(0, 4000);
+  if (record.error_code === 429) turn.error = detail;
+  else {
+    const id = `error-${record.step_index}`;
+    turn.steps.push(new UnifiedStep({ id, type: 'notice', title: 'Agent execution terminated due to error', detail, status: 'failed' }));
+    turn.timeline.push({ kind: 'activity', id });
+  }
+  Object.assign(turn, { status: 'failed', statusEvidence: 'error_message', completedAt: timeOf(record.created_at) || turn.completedAt });
+}
+function scanLimits(steps: unknown[], offset: number, input: number) {
+  const limits = new Map<number, AgRecord>();
+  for (const [index, step] of steps.entries()) {
+    const kind = stepKind(step);
+    if (kind === 'USER_INPUT') input = offset + index;
+    if (input < 0 || !SETTLED.has(stepStatus(step))) continue;
+    const error = shownError(step);
+    if (quotaError(error)) {
+      limits.set(input, { type: 'ERROR_MESSAGE', error_code: 429, content: errorText(error), created_at: get(step, 'metadata', 'createdAt') });
+    } else if (kind === 'PLANNER_RESPONSE' || kind === 'NOTIFY_USER') limits.delete(input);
+  }
+  return { limits, input };
+}
 function stepOutput(step: unknown): string {
   const body = get(step, 'runCommand', 'combinedOutput', 'full') ?? get(step, 'commandStatus', 'combined') ?? get(step, 'sendCommandInput', 'output', 'full') ?? get(step, 'grepSearch', 'rawOutput') ?? '';
   return String(body || '');
@@ -135,7 +165,7 @@ function recordsOfStep(step: unknown, index: number): AgRecord[] {
     const calls = list(get(reply, 'toolCalls')).map(call => { let args: unknown = {}; try { args = parseJson(String(get(call, 'argumentsJson') || '{}')); } catch {} return { id: get(call, 'id'), name: get(call, 'name'), args }; });
     return [{ ...base, type: 'PLANNER_RESPONSE', content: get(reply, 'modifiedResponse') || get(reply, 'response') || '', thinking: get(reply, 'thinking') ? '1' : undefined, tool_calls: calls, model: get(meta, 'requestedModel', 'model') }];
   }
-  if (kind === 'ERROR_MESSAGE') { const error = shownError(step); return error ? [{ ...base, type: 'ERROR_MESSAGE', content: errorText(error) }] : []; }
+  if (kind === 'ERROR_MESSAGE') { const error = shownError(step); return error ? [{ ...base, type: 'ERROR_MESSAGE', content: errorText(error), ...(quotaError(error) ? { error_code: 429 } : {}) }] : []; }
   const toolCallId = get(meta, 'toolCall', 'id');
   if (!toolCallId) return [];
   const records: AgRecord[] = [{ ...base, type: 'GENERIC', tool_call_id: toolCallId, content: stepOutput(step) }];
@@ -193,6 +223,7 @@ class AntigravityBridge extends EventEmitter {
   fetch: typeof fetch; stopping: Set<string>; watchMs: number; settleMs: number; giveUpMs: number;
   catalog: { at: number; models: Model[] } | null; lastModels: Map<string, string>; asks: Map<string, AgAsk>;
   recentCache?: Map<string, { key: string; messages: RecentMessage[] }>;
+  private nativeLimits = new Map<string, { key: string; limits: Map<number, AgRecord> }>();
   lsCache: { at: number; value: LsEnv } | null;
   pidCache: Map<number, { ok: boolean; at: number }>;
   ownIds: Set<string>;
@@ -366,9 +397,7 @@ class AntigravityBridge extends EventEmitter {
     return out;
   }
 
-  summaries(): Bag[] {
-    if (!fs.existsSync(this.dbPath)) return [];
-    const rows = readSqlite(this.dbPath, 'SELECT * FROM conversation_summaries WHERE nesting_depth = 0 ORDER BY last_modified_time DESC;');
+  private archivedIds(): Set<string> {
     const archived = new Set<string>();
     try {
       for (const r of readSqlite(this.dbPath, 'SELECT DISTINCT conversation_id FROM conversations_fts WHERE archived != 0;')) {
@@ -376,6 +405,24 @@ class AntigravityBridge extends EventEmitter {
         if (id) archived.add(id);
       }
     } catch {}
+    return archived;
+  }
+
+  coordinationCatalog(cwd?: string) {
+    if (!fs.existsSync(this.dbPath)) return [];
+    const rows = readSqlite(this.dbPath, 'SELECT conversation_id, title, last_modified_time, workspace_uris FROM conversation_summaries WHERE nesting_depth = 0 ORDER BY last_modified_time DESC;');
+    const archived = this.archivedIds();
+    return rows.flatMap(row => {
+      const folder = workspaceOf(row['workspace_uris']), id = asText(row['conversation_id']);
+      if (!id || archived.has(id) || (cwd && (!folder || path.resolve(folder) !== cwd))) return [];
+      return [{ id, title: asText(row['title']) || 'Antigravity 会话', cwd: folder, updatedAt: toIso(row['last_modified_time']) }];
+    });
+  }
+
+  summaries(): Bag[] {
+    if (!fs.existsSync(this.dbPath)) return [];
+    const rows = readSqlite(this.dbPath, 'SELECT * FROM conversation_summaries WHERE nesting_depth = 0 ORDER BY last_modified_time DESC;');
+    const archived = this.archivedIds();
     return rows.filter(item => {
       const id = asText(item['conversation_id']);
       if (this.ownIds.has(id) || this.activeWatchers.has(id)) return true;
@@ -436,14 +483,35 @@ class AntigravityBridge extends EventEmitter {
     return recent;
   }
 
+  private waiting = new Map<string, 'input' | 'approval'>();
+  private answering = new Set<string>();
+  private answered = new Map<string, Set<number>>();
+  private async openRequests(id: string, row: Bag) {
+    const offset = Math.max(0, Number(row['last_user_input_step_index']) || 0);
+    const response = await this.ls('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: offset }, { timeout: 3000 });
+    const requests = list(get(response, 'steps')).flatMap((step, i) => stepStatus(step) === 'WAITING' && get(step, 'requestedInteraction')
+      ? [{ step, index: offset + i }] : []);
+    const answered = this.answered.get(id);
+    if (!answered) return requests;
+    for (const index of answered) if (!requests.some(request => request.index === index)) answered.delete(index);
+    if (!answered.size) this.answered.delete(id);
+    return requests.filter(request => !answered.has(request.index));
+  }
   async listConversations(): Promise<UnifiedSession[]> {
     const blocked = this.sendBlockedReason();
-    return this.summaries().map(item => {
+    return Promise.all(this.summaries().map(async item => {
       const session = this.sessionOf(item, blocked), id = asText(item['conversation_id']);
       const model = this.lastModels.get(id);
-      session.metadata = { ...session.metadata, recentMessages: this.recentMessages(id), ...(model !== undefined ? { model } : {}) };
+      if (session.status === 'busy') {
+        try {
+          const [open] = await this.openRequests(id, item);
+          if (open) this.waiting.set(id, get(open.step, 'requestedInteraction', 'askQuestion') ? 'input' : 'approval');
+          else this.waiting.delete(id);
+        } catch { /* Keep the last native answer while the language server reconnects. */ }
+      } else { this.waiting.delete(id); this.answered.delete(id); }
+      session.metadata = { ...session.metadata, waitingFor: this.waiting.get(id), recentMessages: this.recentMessages(id), ...(model !== undefined ? { model } : {}) };
       return session;
-    });
+    }));
   }
 
   async parseTranscript(file: string): Promise<ParsedHistory> {
@@ -455,17 +523,12 @@ class AntigravityBridge extends EventEmitter {
   // Transcript records (from the file, or rewritten from the language server's steps) → turns.
   async parseRecords(records: AsyncIterable<unknown>, conversationId = ''): Promise<ParsedHistory> {
     const turns: UnifiedTurn[] = [];
-    let turn: UnifiedTurn | null = null, model = '', modelId: unknown = '', pending: UnifiedStep[] = [], since: unknown = null, failure: unknown = null;
+    let turn: UnifiedTurn | null = null, model = '', modelId: unknown = '', pending: UnifiedStep[] = [], since: unknown = null, failure: AgRecord | null = null;
     const said = new Map<string, unknown>();
     const close = () => {
       if (!turn) return;
       // An error with nothing after it ended the turn, as the desktop shows it.
-      if (failure) {
-        const id = `error-${get(failure, 'step_index')}`;
-        turn.steps.push(new UnifiedStep({ id, type: 'notice', title: 'Agent execution terminated due to error', detail: String(get(failure, 'content') || get(failure, 'error') || '').replace(/^Error:\s*/, '').slice(0, 4000), status: 'failed' }));
-        turn.timeline.push({ kind: 'activity', id });
-        Object.assign(turn, { status: 'failed', statusEvidence: 'error_message', completedAt: timeOf(get(failure, 'created_at')) || turn.completedAt });
-      }
+      if (failure) recordFailure(turn, failure);
       for (const step of turn.steps) if (step.status === 'running') step.status = failure ? 'interrupted' : 'completed';
       assignPhases(turn);
       // The desktop's "Worked for": from the last prompt (the person's or a system message)
@@ -505,7 +568,7 @@ class AntigravityBridge extends EventEmitter {
         turn.timeline.push({ kind: 'activity', id });
         since = get(record, 'created_at'); failure = null;
       } else if (turn && type === 'ERROR_MESSAGE') {
-        failure = record;
+        failure = bag(record) || null;
       } else if (turn && type === 'PLANNER_RESPONSE') {
         const current: UnifiedTurn = turn;
         failure = null;
@@ -557,11 +620,37 @@ class AntigravityBridge extends EventEmitter {
     return parsed;
   }
 
+  // Quota failures can be present in the desktop trajectory and absent from its JSONL export.
+  // Read only the end of this selected conversation, cached by its native revision.
+  private async mergeNativeLimits(id: string, row: Bag, turns: UnifiedTurn[]) {
+    const count = Number(row['step_count']);
+    if (!turns.length || !Number.isInteger(count) || count <= 0) return;
+    const key = `${count}:${row['last_modified_time']}`, cached = this.nativeLimits.get(id);
+    let limits = cached?.limits;
+    if (cached?.key !== key) {
+      const offset = Math.max(0, count - NATIVE_LIMIT_LOOKBACK);
+      const inputs = turns.map(turn => Number(/^turn-(\d+)$/.exec(turn.id)?.[1]));
+      const input = inputs.findLast(value => value <= offset) ?? -1;
+      try {
+        const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: offset }, { timeout: 3500 }), 'steps'));
+        limits = scanLimits(steps, offset, input).limits;
+        this.nativeLimits.set(id, { key, limits });
+        if (this.nativeLimits.size > 24) this.nativeLimits.delete(this.nativeLimits.keys().next().value!);
+      } catch { /* The transcript remains available while the desktop reconnects. */ }
+    }
+    for (const turn of turns) {
+      const record = limits?.get(Number(/^turn-(\d+)$/.exec(turn.id)?.[1]));
+      if (record) recordFailure(turn, record);
+    }
+  }
+
   async getConversationHistory(conversationId: string): Promise<{ session: UnifiedSession; turns: UnifiedTurn[] }> {
     const file = this.transcriptPath(conversationId);
-    const row = this.summaries().find(item => item['conversation_id'] === conversationId);
+    const row = fs.existsSync(this.dbPath) ? readSqlite(this.dbPath,
+      'SELECT conversation_id, title, preview, last_modified_time, workspace_uris, not_fully_idle, killed, status, step_count, last_user_input_time, last_user_input_step_index FROM conversation_summaries WHERE conversation_id = ? LIMIT 1', [conversationId])[0] : undefined;
     let parsed: ParsedHistory;
-    if (!fs.existsSync(file)) {
+    const hasTranscript = fs.existsSync(file);
+    if (!hasTranscript) {
       if (!row) throw Object.assign(new Error(`Transcript not found for conversation ${conversationId}`), { status: 404 });
       try { parsed = await this.remoteHistory(conversationId, row); } catch { parsed = { turns: [], model: '', modelId: '' }; }
     } else {
@@ -575,13 +664,32 @@ class AntigravityBridge extends EventEmitter {
     }
     while (this.historyCache.size > 24) { const oldest = this.historyCache.keys().next().value; if (oldest === undefined) break; this.historyCache.delete(oldest); }
     const turns = structuredClone(parsed.turns);
+    if (row && hasTranscript) await this.mergeNativeLimits(conversationId, row, turns);
     const session = row ? this.sessionOf(row) : new UnifiedSession({ id: conversationId, engine: 'antigravity', title: turns[0]?.userPrompt?.slice(0, 40) || 'Antigravity 会话', sendBlocked: this.sendBlockedReason() });
     // The model this conversation last used, under the name the desktop's picker shows: the
     // console's model menu starts on it (the list carries it too once it has been read).
-    const model = parsed.model || this.catalog?.models.find(item => item.id === parsed.modelId)?.name || '';
+    const model = parsed.model || this.catalog?.models.find(item => item.id === parsed.modelId || item.agentId === parsed.modelId)?.name || '';
     if (model) this.lastModels.set(conversationId, model);
-    session.metadata = { ...session.metadata, model };
+    session.metadata = { ...session.metadata, model, ...(parsed.modelId ? { desktop: { model: String(parsed.modelId) } } : {}) };
+    const last = turns.at(-1);
+    if (row && session.status === 'busy' && last && !last.statusEvidence) {
+      try {
+        last.approvals = (await this.openRequests(conversationId, row)).flatMap(({ index, step }) => this.askOf(conversationId, index, step, false) || []);
+      } catch { /* The transcript can still be viewed offline. */ }
+    }
     return { session, turns };
+  }
+
+  async coordinationHistory(id: string) {
+    const history = await this.getConversationHistory(id), turn = history.turns.at(-1);
+    if (!turn || turn.statusEvidence) return history;
+    const row = this.row(id);
+    if (!row || Number(row['not_fully_idle']) !== 0) return history;
+    const edge = Number(row['last_user_input_step_index']);
+    if (!Number.isInteger(edge) || turn.id !== `turn-${edge}`) return history;
+    const outcome = await this.turnOutcome(id, row, { requireSettled: true });
+    if (outcome) Object.assign(turn, { status: outcome.status, statusEvidence: 'desktop_trajectory' });
+    return history;
   }
 
   // Per-model quota from the language server Antigravity itself runs. Reachable only
@@ -672,6 +780,20 @@ class AntigravityBridge extends EventEmitter {
     return this.catalog?.models || MODEL_ALIASES;
   }
 
+  async coordinationDefaultModel(): Promise<string> {
+    const data = await this.ls('GetCascadeModelConfigData');
+    return asText(get(data, 'defaultOverrideModelConfig', 'modelOrAlias', 'model'));
+  }
+
+  private async plannerModel(model: string): Promise<string> {
+    if (isPlannerModel(model)) return model;
+    // History can carry the provider's alias (modelId). The language server's
+    // planner expects the matching model enum from the desktop's current catalog.
+    const matches = new Set((await this.getModels()).filter(item => item.agentId === model && isPlannerModel(item.id)).map(item => item.id));
+    if (matches.size === 1) return matches.values().next().value!;
+    throw Object.assign(new Error('Antigravity 桌面端现在没有提供这个模型，消息没有发出'), { status: 400, notSent: true });
+  }
+
   // The desktop's channel takes text: attachments go in as the shared notes (core/attachments.ts).
   buildAgyPrompt(prompt: string | undefined, attachments: SendInput['attachments'] | undefined): string | undefined {
     return attachments?.length ? withAttachments(prompt, attachments) : prompt;
@@ -705,10 +827,10 @@ class AntigravityBridge extends EventEmitter {
   // id; it rides in the message's own config, as a pick in the desktop's menu does.
   async sendUserMessage(conversationId: string, message: string | undefined, { steer = false, model = '' }: { steer?: boolean; model?: string } = {}): Promise<void> {
     if (!this.binPath || !this.lsEnv()) throw Object.assign(new Error(this.sendBlockedReason() || NO_LS), { status: 503 });
-    if (model && !/^MODEL_[A-Z0-9_]+$/.test(model)) throw Object.assign(new Error('Antigravity 桌面端现在没有提供这个模型，消息没有发出'), { status: 400 });
+    const wanted = model ? await this.plannerModel(model) : undefined;
     const body = { cascadeId: conversationId, items: [{ text: message }], messageOrigin: 'AGENT_MESSAGE_ORIGIN_IDE',
       ...(steer ? { deliveryStrategy: 'MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION' } : {}),
-      ...(model ? { cascadeConfig: { plannerConfig: { requestedModel: { model } } } } : {}) };
+      ...(wanted ? { cascadeConfig: { plannerConfig: { requestedModel: { model: wanted } } } } : {}) };
     try { await this.ls('SendUserCascadeMessage', body, { timeout: 30000 }); }
     catch (err) {
       const code = errorField(err, 'code'), detail = errorField(err, 'detail');
@@ -740,10 +862,10 @@ class AntigravityBridge extends EventEmitter {
   }
 
   // A message sent while the agent works joins the running turn, as the person's message.
-  async steer(conversationId: string, { prompt, attachments }: Partial<SendInput> = {}): Promise<Record<string, never>> {
+  async steer(conversationId: string, { prompt, attachments, model }: Partial<SendInput> = {}): Promise<Record<string, never>> {
     const reason = this.sendBlockedReason();
     if (reason) throw Object.assign(new Error(reason), { status: 503 });
-    await this.sendUserMessage(conversationId, this.buildAgyPrompt(prompt, attachments), { steer: true });
+    await this.sendUserMessage(conversationId, this.buildAgyPrompt(prompt, attachments), { steer: true, model });
     return {};
   }
 
@@ -805,20 +927,38 @@ class AntigravityBridge extends EventEmitter {
 
   // What a step waits on the person for, as a card in the chat: a permission to allow or refuse,
   // or the agent's own question with its options. The desktop shows the same step the same way.
-  askOf(conversationId: string, index: number, step: unknown): Approval | null {
+  askOf(conversationId: string, index: number, step: unknown, register = true): Approval | null {
     const spec = bag(get(step, 'requestedInteraction')) || {}, kind = Object.keys(spec)[0];
     if (!kind) return null;
     const body = spec[kind] || {}, id = `${conversationId}_${index}`;
     const command = asText(get(step, 'runCommand', 'proposedCommandLine') || get(step, 'runCommand', 'commandLine') || '');
     let card: Omit<Approval, 'id'> & { id?: string };
     if (kind === 'askQuestion') {
-      card = questionCard(id, list(get(body, 'questions')).map(item => ({ question: asText(get(item, 'question')), multi: !!get(item, 'isMultiSelect'), options: list(get(item, 'options')).map(option => ({ id: String(get(option, 'id')), label: asText(get(option, 'text')) })) })), 'Antigravity');
+      card = questionCard(id, list(get(body, 'questions')).map(item => ({ question: asText(get(item, 'question')), multi: !!get(item, 'isMultiSelect'), options: list(get(item, 'options')).map(option => ({ id: String(get(option, 'id')), label: asText(get(option, 'text')) })) })), 'Antigravity', { desktop: true });
     } else {
       card = { title: kind === 'runCommand' ? '允许 Antigravity 运行这条命令？' : asText(get(body, 'actionDescription') || '允许 Antigravity 执行这个操作？'),
         detail: command || [get(body, 'resource', 'action'), get(body, 'resource', 'target'), get(body, 'absolutePathUri'), get(body, 'url'), get(body, 'reason')].filter(Boolean).join(' · ') || asText(get(step, 'metadata', 'toolCall', 'name') || ''), decisions: ['accept', 'decline'] };
     }
-    this.asks.set(id, { conversationId, index, kind, body, command, trajectoryId: asText(get(step, 'metadata', 'sourceTrajectoryStepInfo', 'trajectoryId') || '') });
-    return { id, ...card };
+    if (register) this.asks.set(id, { conversationId, index, kind, body, command, trajectoryId: asText(get(step, 'metadata', 'sourceTrajectoryStepInfo', 'trajectoryId') || '') });
+    return { id, ...card, ...(kind === 'askQuestion' && { kind: 'input' as const }) };
+  }
+
+  async decideNative(session: string, id: string, decision: unknown) {
+    const held = this.asks.get(id);
+    const row = this.row(session) || (held?.conversationId === session ? { last_user_input_step_index: held.index } : null);
+    if (!row || this.answering.has(id)) throw Object.assign(new Error('这个确认已经处理过了'), { status: 409 });
+    this.answering.add(id);
+    try {
+      const steps = await this.openRequests(session, row);
+      const open = steps.find(({ index }) => id === `${session}_${index}`);
+      const card = open && this.askOf(session, open.index, open.step);
+      if (!card || typeof decision !== 'string' || decision === 'desktop' || !card.decisions.some(option => decision === (typeof option === 'string' ? option : option.id))) {
+        throw Object.assign(new Error('这个选项已失效'), { status: 409 });
+      }
+      await this.decide(id, decision);
+      const answered = this.answered.get(session) || new Set<number>();
+      answered.add(open!.index); this.answered.set(session, answered);
+    } finally { this.answering.delete(id); }
   }
 
   // The person's answer goes back the way the desktop's own buttons send it.
@@ -851,19 +991,20 @@ class AntigravityBridge extends EventEmitter {
   // message goes in like any other; agentapi cannot name a folder. Without one: agentapi.
   async newConversation({ prompt, title, model, attachments, cwd }: CreateInput): Promise<CreateResult> {
     const reason = this.sendBlockedReason();
-    if (reason) throw Object.assign(new Error(reason), { status: 503 });
+    if (reason) throw Object.assign(new Error(reason), { status: 503, notSent: true });
     if (cwd) {
-      if (!path.isAbsolute(cwd) || !fs.existsSync(cwd)) throw Object.assign(new Error('这个文件夹不存在，聊天没有新建'), { status: 400 });
+      if (!path.isAbsolute(cwd) || !fs.existsSync(cwd)) throw Object.assign(new Error('这个文件夹不存在，聊天没有新建'), { status: 400, notSent: true });
       // The executor refuses to start without a model ("plan model not specified"), so a
       // cascade the console starts carries one explicitly: the pick the person made, else the
       // first model the desktop offers (verified against the live language server, 2.32.1).
-      const wanted = model || (await this.getModels())[0]?.id;
+      const selected = model || (await this.getModels())[0]?.id;
+      const wanted = selected ? await this.plannerModel(selected) : undefined;
       const config = wanted ? { plannerConfig: { requestedModel: { model: wanted } } } : undefined;
       let started: unknown;
       try { started = await this.ls('StartCascade', { source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT', trajectoryType: 'CORTEX_TRAJECTORY_TYPE_CASCADE', workspaceUris: [pathToFileURL(cwd).href], ...(config ? { config } : {}) }); }
-      catch (err) { throw Object.assign(new Error(`Antigravity 没有在这个文件夹里新建聊天（${lsDetail(err)}）`), { status: lsStatus(err) }); }
+      catch (err) { throw Object.assign(new Error(`Antigravity 没有在这个文件夹里新建聊天（${lsDetail(err)}）`), { status: lsStatus(err), notSent: true }); }
       const cascadeId = get(started, 'cascadeId');
-      if (!cascadeId) throw new Error('Antigravity 未返回会话 ID');
+      if (!cascadeId) throw Object.assign(new Error('Antigravity 未返回会话 ID'), { notSent: true });
       const id = String(cascadeId);
       this.ownIds.add(id);
       await this.sendUserMessage(id, this.buildAgyPrompt(prompt, attachments), { model: wanted });
@@ -883,7 +1024,9 @@ class AntigravityBridge extends EventEmitter {
 
   // How the turn after the person's last message ended, from the language server's record:
   // an error the desktop shows, a stop, or done. null: nothing has followed the message yet.
-  async turnOutcome(conversationId: string, row: Bag, { failure = '', received = false }: { failure?: string; received?: boolean } = {}): Promise<Outcome | null> {
+  async turnOutcome(conversationId: string, row: Bag, { failure = '', received = false, requireSettled = false }: {
+    failure?: string; received?: boolean; requireSettled?: boolean;
+  } = {}): Promise<Outcome | null> {
     try {
       const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: conversationId, stepOffset: Math.max(0, Number(row['last_user_input_step_index']) || 0) }), 'steps'));
       // System notices (an MCP's context injections among them) are not how a turn ends, and a
@@ -891,7 +1034,7 @@ class AntigravityBridge extends EventEmitter {
       // said only when the desktop answered (its reply, or the notification it shows), failed on
       // its error, interrupted on its stop. Anything else is still waiting for its ending.
       const last = steps.slice(1).filter(step => stepKind(step) !== 'EPHEMERAL_MESSAGE').at(-1);
-      if (!last) return null;
+      if (!last || (requireSettled && !SETTLED.has(stepStatus(last)))) return null;
       const error = shownError(last);
       if (error) return { status: 'failed', error: { message: errorText(error) } };
       if (['CANCELED', 'INTERRUPTED'].includes(stepStatus(last))) return { status: 'interrupted' };
@@ -907,6 +1050,7 @@ class AntigravityBridge extends EventEmitter {
   // a turn can end at once with an error (a model the conversation used is gone) and no reply.
   watchTurn(conversationId: string, emitter: EngineEmitter & { once(event: 'interrupt', listener: () => void): unknown }, { file = '', offset = 0, next = 0, baseline = -1 }: { file?: string; offset?: number; next?: number; baseline?: number } = {}): void {
     let stopped = false, received = false, checking = false, polling = false, idleChecks = 0, missing = 0, failure = '';
+    let observedInput = -1;
     // `said`: the replies whose record has come; a reply being written is shown until then.
     const pending: string[] = [], said = new Set<string>(), started = Date.now();
     const cleanup = () => { stopped = true; tailer?.close(); clearInterval(checker); clearInterval(poller); this.stopping.delete(conversationId); for (const id of waiting.values()) this.asks.delete(id); if (this.activeWatchers.get(conversationId)?.emitter === emitter) this.activeWatchers.delete(conversationId); };
@@ -945,6 +1089,9 @@ class AntigravityBridge extends EventEmitter {
       try {
         const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: conversationId, stepOffset: next }), 'steps'));
         if (stopped) return;
+        const { limits, input } = scanLimits(steps, next, observedInput);
+        observedInput = input;
+        const limit = input > baseline ? limits.get(input) : undefined;
         const open = new Set<number>(); let index = next, settled = true;
         for (const step of steps) {
           const status = stepStatus(step);
@@ -963,6 +1110,10 @@ class AntigravityBridge extends EventEmitter {
           index++;
         }
         for (const [at, id] of waiting) if (!open.has(at)) { waiting.delete(at); this.asks.delete(id); emitter.emit('approval_resolved', { id }); }
+        if (limit) {
+          cleanup();
+          emitter.emit('completed', { turn: { status: 'failed', error: { message: asText(limit.content) } } });
+        }
       } catch {} finally { polling = false; }
     };
     // Often enough for a reply being written to read as it grows.

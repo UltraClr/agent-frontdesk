@@ -146,6 +146,12 @@ html[data-ui="kit"] .kit-turn:hover .kit-turn-actions, html[data-ui="kit"] .kit-
 html[data-ui="kit"] .kit-turn-actions .icon-button { width: 28px; height: 28px; color: var(--kit-muted); }
 html[data-ui="kit"] .kit-turn-actions .lucide { width: 15px; height: 15px; }
 html[data-ui="kit"] .kit-body .artifact-grid, html[data-ui="kit"] .kit-body .approval { margin: 0 0 16px; }
+html[data-ui="kit"] .kit-proposed-plan { border: 1px solid var(--kit-card-line); border-radius: 12px; padding: 16px; }
+html[data-ui="kit"] .kit-question-form fieldset { margin: 0 0 16px; border: 0; padding: 0; min-width: 0; }
+html[data-ui="kit"] .kit-question-form legend { margin-bottom: 6px; padding: 0; font-weight: 600; }
+html[data-ui="kit"] .kit-question-form textarea { width: 100%; margin-top: 6px; padding: 8px 10px; color: inherit; background: transparent; border: 1px solid var(--kit-card-line); border-radius: 8px; resize: vertical; font: inherit; }
+html[data-ui="kit"] .kit-question-option { display: flex; align-items: baseline; gap: 8px; padding: 5px 0; cursor: pointer; }
+html[data-ui="kit"] .kit-question-option small { display: block; color: var(--kit-muted); }
 
 /* empty state: Clawd in the middle, as on the desktop's new session page */
 html[data-ui="kit"] .empty-conversation { align-items: center; text-align: center; justify-content: center; min-height: 60vh; gap: 10px; }

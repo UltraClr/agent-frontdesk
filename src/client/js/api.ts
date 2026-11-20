@@ -2,7 +2,7 @@ import { say } from './i18n.js';
 import { get, str } from '../../shared/guards.js';
 import type { BridgeEvent, RunTurn } from '../../shared/contract.js';
 
-export interface RequestOptions { method?: string; body?: BodyInit | null; headers?: Record<string, string>; signal?: AbortSignal }
+export interface RequestOptions { method?: string; body?: BodyInit | null; headers?: Record<string, string>; signal?: AbortSignal; keepalive?: boolean }
 /**
  * The server's JSON answer. Trust boundary, on purpose: the page and the server are built from
  * the same contract (src/shared/contract.ts), so the caller names the shape it asked for; the

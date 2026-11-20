@@ -72,12 +72,44 @@ test('"最近" lists every chat newest first, project ones tagged; a search show
   assert.equal(recentRows(`s${CHAT_ROWS + 4}`), CHAT_ROWS + 5);
 });
 
+test('recent unread and native pins precede projects, and list choices persist per agent', async () => {
+  const { renderSidebar, SidebarPrefs } = await import('../src/client/js/sidebar.js');
+  const store = storage(), prefs = new SidebarPrefs(store);
+  const sessions = [
+    session('parent', { cwd: '/work' }), session('child', { metadata: { parentId: 'parent', pinnedRank: 1 } }),
+    session('old'), session('new'), session('running'), session('pinned', { metadata: { pinnedRank: 0 } }),
+  ];
+  const unread = new Map([['old', 1], ['running', 2], ['child', 3], ['new', 4]]);
+  const options = { engineId: 'one', prefs, projects: [{ id: 'fav', name: 'Favorite', pinned: true }],
+    status: (item: { id: string }) => ({ unread: unread.has(item.id), unreadAt: unread.get(item.id), running: item.id === 'running' }) };
+  const ids = (html: string) => [...html.matchAll(/data-session="([^"]+)"/g)].map(match => match[1]);
+  const html = renderSidebar(sessions, options);
+  assert.deepEqual([...html.matchAll(/data-side-section="([^"]+)"/g)].map(match => match[1]), ['unread', 'pinned', 'projects', 'recents']);
+  assert.deepEqual(ids(html.split('data-side-section="pinned"')[0]!), ['new', 'child', 'running']);
+  assert.match(html, /data-view-unread/);
+  prefs.setView('one', 'pinned');
+  assert.deepEqual(ids(renderSidebar(sessions, { ...options, prefs: new SidebarPrefs(store) })), ['pinned', 'child']);
+  assert.match(renderSidebar(sessions, options), /Favorite/);
+  assert.equal(new SidebarPrefs(store).view('two'), 'all');
+  prefs.setView('one', 'unread');
+  assert.deepEqual(ids(renderSidebar(sessions, options)), ['new', 'child', 'running', 'old']);
+  unread.delete('new');
+  assert.deepEqual(ids(renderSidebar(sessions, options)), ['child', 'running', 'old']);
+  assert.match(renderSidebar([], options), /没有未读会话/);
+  prefs.setView('one', 'projects');
+  assert.match(renderSidebar(sessions, options), /Favorite/);
+  assert.doesNotMatch(renderSidebar(sessions, options), /data-side-section="recents"/);
+  prefs.setView('one', 'recents');
+  assert.doesNotMatch(renderSidebar(sessions, options), /data-side-section="projects"/);
+});
+
 test('Codex threads resolve to the desktop project, a project root, or no project', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(path.join(home, '.codex-global-state.json'), JSON.stringify({
     'app-server-project-id-by-legacy-project-id-by-host': { local: { old1: 'P1', old2: 'P2' } },
     'thread-project-assignments': { t1: { projectKind: 'local', projectId: 'old2' }, gone: { projectId: 'deleted' } },
+    'pinned-project-ids': ['old2'],
     'projectless-thread-ids': ['t3'], 'project-order': ['old2', 'old1'],
   }));
   const index = new CodexProjects({ codexHome: home }).index([
@@ -86,6 +118,7 @@ test('Codex threads resolve to the desktop project, a project root, or no projec
     { id: 'P3', name: 'new', position: 2, roots: [{ path: '/w/new/' }] },
   ]);
   assert.deepEqual(index.projects.map(item => item.name), ['new', 'two', 'one']);
+  assert.equal(index.projects.find(item => item.id === 'P2')?.pinned, true);
   assert.equal(index.resolve({ id: 't1', cwd: '/w/one' })?.name, 'two'); // assigned by hand
   assert.equal(index.resolve({ id: 't2', cwd: '/w/one/src' })?.name, 'one'); // by folder
   assert.equal(index.resolve({ id: 't3', cwd: '/w/one' }), null); // marked projectless
@@ -106,18 +139,25 @@ test('Codex threads resolve to the desktop project, a project root, or no projec
 
 test('Codex lists every page of threads once, each with its project', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+  fs.writeFileSync(path.join(home, '.codex-global-state.json'), JSON.stringify({ 'pinned-thread-ids': ['c', 'missing-from-list', 'a', 'stale'] }));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const bridge = new CodexBridge({ codexBin: null, codexHome: home }); bridge.isReady = true;
   const calls: Array<[string, unknown]> = [];
   bridge.send = async (method, params) => {
     calls.push([method, get(params, 'cursor') || null]);
+    if (method === 'thread/read') {
+      assert.equal(get(params, 'includeTurns'), false);
+      if (get(params, 'threadId') === 'stale') throw new Error('Missing thread');
+      return { result: { thread: { id: 'missing-from-list', name: 'Pinned', cwd: '/w/proj' } } };
+    }
     if (method === 'project/list') return { result: { data: [{ id: 'P', name: 'proj', position: 0, roots: [{ path: '/w/proj' }] }] } };
     if (!get(params, 'cursor')) return { result: { data: [{ id: 'a', name: 'A', cwd: '/w/proj' }, { id: 'b', preview: 'first line\nsecond', cwd: '/docs/2026-01-01/new-chat' }], nextCursor: 'next' } };
     return { result: { data: [{ id: 'a', name: 'A', cwd: '/w/proj' }, { id: 'c', name: 'C', cwd: '/w/proj/sub', parentThreadId: 'a' }] } };
   };
   const sessions = await bridge.listThreads();
-  assert.deepEqual(sessions.map(item => [item.id, item.title, item.metadata.group?.name ?? null]), [['a', 'A', 'proj'], ['b', 'first line', null], ['c', 'C', 'proj']]);
+  assert.deepEqual(sessions.map(item => [item.id, item.title, item.metadata.group?.name ?? null]), [['a', 'A', 'proj'], ['b', 'first line', null], ['c', 'C', 'proj'], ['missing-from-list', 'Pinned', 'proj']]);
   assert.equal(at(sessions, 2).metadata.parentId, 'a');
+  assert.deepEqual(sessions.map(item => item.metadata.pinnedRank), [2, undefined, 0, 1]);
   assert.deepEqual(calls.filter(([method]) => method === 'thread/list').map(([, cursor]) => cursor), [null, 'next']);
   assert.deepEqual(await bridge.listProjects(), [{ id: 'P', name: 'proj', cwd: '/w/proj' }]);
 });

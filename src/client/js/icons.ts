@@ -7,8 +7,11 @@
 import replaceElement from 'lucide/dist/esm/replaceElement.js';
 import AppWindow from 'lucide/dist/esm/icons/app-window.js';
 import ArrowDown from 'lucide/dist/esm/icons/arrow-down.js';
+import ArrowLeft from 'lucide/dist/esm/icons/arrow-left.js';
+import ArrowRight from 'lucide/dist/esm/icons/arrow-right.js';
 import ArrowUp from 'lucide/dist/esm/icons/arrow-up.js';
 import ArrowUpRight from 'lucide/dist/esm/icons/arrow-up-right.js';
+import AtSign from 'lucide/dist/esm/icons/at-sign.js';
 import BookOpen from 'lucide/dist/esm/icons/book-open.js';
 import Check from 'lucide/dist/esm/icons/check.js';
 import ChevronDown from 'lucide/dist/esm/icons/chevron-down.js';
@@ -16,6 +19,7 @@ import ChevronRight from 'lucide/dist/esm/icons/chevron-right.js';
 import ChevronsRight from 'lucide/dist/esm/icons/chevrons-right.js';
 import CircleAlert from 'lucide/dist/esm/icons/circle-alert.js';
 import CircleStop from 'lucide/dist/esm/icons/circle-stop.js';
+import Clock3 from 'lucide/dist/esm/icons/clock-3.js';
 import Code from 'lucide/dist/esm/icons/code.js';
 import Copy from 'lucide/dist/esm/icons/copy.js';
 import Download from 'lucide/dist/esm/icons/download.js';
@@ -28,8 +32,10 @@ import Folder from 'lucide/dist/esm/icons/folder.js';
 import FolderOpen from 'lucide/dist/esm/icons/folder-open.js';
 import FolderSearch from 'lucide/dist/esm/icons/folder-search.js';
 import GripVertical from 'lucide/dist/esm/icons/grip-vertical.js';
+import History from 'lucide/dist/esm/icons/history.js';
 import Info from 'lucide/dist/esm/icons/info.js';
 import ListChecks from 'lucide/dist/esm/icons/list-checks.js';
+import ListFilter from 'lucide/dist/esm/icons/list-filter.js';
 import ListPlus from 'lucide/dist/esm/icons/list-plus.js';
 import Mail from 'lucide/dist/esm/icons/mail.js';
 import MessageSquareQuote from 'lucide/dist/esm/icons/message-square-quote.js';
@@ -46,19 +52,21 @@ import ScanLine from 'lucide/dist/esm/icons/scan-line.js';
 import Search from 'lucide/dist/esm/icons/search.js';
 import Send from 'lucide/dist/esm/icons/send.js';
 import Settings from 'lucide/dist/esm/icons/settings.js';
+import Sparkles from 'lucide/dist/esm/icons/sparkles.js';
 import Square from 'lucide/dist/esm/icons/square.js';
 import SquarePen from 'lucide/dist/esm/icons/square-pen.js';
 import Terminal from 'lucide/dist/esm/icons/terminal.js';
 import TextCursorInput from 'lucide/dist/esm/icons/text-cursor-input.js';
+import UsersRound from 'lucide/dist/esm/icons/users-round.js';
 import Wrench from 'lucide/dist/esm/icons/wrench.js';
 import X from 'lucide/dist/esm/icons/x.js';
 
 // By the name lucide gives each icon ("file-check-2" is "FileCheck2"): replaceElement looks them up so.
 const drawn: Record<string, unknown> = {
-  AppWindow, ArrowDown, ArrowUp, ArrowUpRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronsRight, CircleAlert, CircleStop, Code, Copy,
-  Download, Ellipsis, ExternalLink, File, FileCheck2, FileText, Folder, FolderOpen, FolderSearch, GripVertical, Info, ListChecks, ListPlus,
+  AppWindow, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, AtSign, BookOpen, Check, ChevronDown, ChevronRight, ChevronsRight, CircleAlert, CircleStop, Clock3, Code, Copy,
+  Download, Ellipsis, ExternalLink, File, FileCheck2, FileText, Folder, FolderOpen, FolderSearch, GripVertical, History, Info, ListChecks, ListFilter, ListPlus,
   Mail, MessageSquareQuote, MessagesSquare, Mic, MonitorSmartphone, PanelLeft, PanelLeftClose, PanelRight, Pencil, Plus, RefreshCw, ScanLine, Search, Send,
-  Settings, Square, SquarePen, Terminal, TextCursorInput, Wrench, X,
+  Settings, Sparkles, Square, SquarePen, Terminal, TextCursorInput, UsersRound, Wrench, X,
 };
 const named = (name: string): string => name.replace(/(\w)(\w*)(_|-|\s*)/g, (_all, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase());
 export const hasIcon = (name: string): boolean => named(name) in drawn;

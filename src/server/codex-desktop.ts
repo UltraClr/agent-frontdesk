@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { bag, get, isBag, list, parseJson } from '../shared/guards.js';
+import type { EngineItem, PlanItem } from '../shared/contract.js';
 
 const STEER_VERSION = 1; // the desktop's protocol version for thread-follower-steer-turn
 const INTERRUPT_VERSION = 4; // …and for thread-follower-interrupt-turn with an expected turn
@@ -26,10 +27,11 @@ const OWNER_WAIT_MS = 500;
 export interface IpcError extends Error { code: string }
 /** The socket the IPC is spoken over (net.Socket, or a stand-in in tests). */
 export type Connect = (sock: string) => net.Socket;
-export interface RequestOptions { version?: number; timeoutMs?: number; sock?: string; connect?: Connect }
+export interface RequestOptions { version?: number; timeoutMs?: number; sock?: string; connect?: Connect; targetClientId?: string }
 export interface WatchOptions { sock?: string; connect?: Connect; hostId?: string; retryMs?: number }
 /** One of the desktop's requests to the person, as its state holds it. */
 export interface DesktopRequest { id: unknown; method: unknown; params: unknown }
+export interface DesktopTurn { id: string; planItems: EngineItem[]; checklist?: EngineItem & { plan: PlanItem[] } }
 export interface Watcher { close(): void }
 /** An app-server input item, as the desktop's composer sends it. */
 export type CodexInput = { type: string; [field: string]: unknown };
@@ -74,7 +76,7 @@ function refuseServing(socket: net.Socket, message: unknown): boolean {
 }
 
 // One short-lived connection: initialize, send one request, wait for its response, close.
-function request(method: string, params: unknown, { version = 0, timeoutMs = 30000, sock = socketPath(), connect = net.createConnection }: RequestOptions = {}): Promise<unknown> {
+function request(method: string, params: unknown, { version = 0, timeoutMs = 30000, sock = socketPath(), connect = net.createConnection, targetClientId }: RequestOptions = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = connect(sock);
     let buffer: Buffer = Buffer.alloc(0), clientId: unknown = null, settled = false;
@@ -95,7 +97,7 @@ function request(method: string, params: unknown, { version = 0, timeoutMs = 300
         if (id === initId) {
           if (get(message, 'resultType') !== 'success') { done(new Error('Codex 桌面版拒绝了连接')); return false; }
           clientId = get(message, 'result', 'clientId');
-          socket.write(frame({ type: 'request', requestId, sourceClientId: clientId, version, method, params, timeoutMs }));
+          socket.write(frame({ type: 'request', requestId, sourceClientId: clientId, version, method, params, timeoutMs, targetClientId }));
         } else if (id === requestId) {
           if (get(message, 'resultType') === 'error') { const code = String(get(message, 'error') || 'error'); done(ipcError(code, code)); return false; }
           done(null, get(message, 'result'));
@@ -164,7 +166,7 @@ function applyPatches(base: unknown, patches: readonly Patch[]): unknown {
     const at = list(rawPath);
     if (!at.length) { root = op === 'remove' ? undefined : value; continue; }
     let parent: unknown = root;
-    for (const key of at.slice(0, -1)) { if (parent == null) break; parent = get(parent, String(key)); }
+    for (const key of at.slice(0, -1)) { if (!isBag(parent) || !Object.hasOwn(parent, String(key))) { parent = null; break; } parent = get(parent, String(key)); }
     if (parent == null || typeof parent !== 'object') continue;
     const last = at[at.length - 1];
     if (Array.isArray(parent)) {
@@ -175,7 +177,7 @@ function applyPatches(base: unknown, patches: readonly Patch[]): unknown {
       else if (op === 'remove') items.splice(index, 1);
       else items[index] = value;
     } else if (op === 'remove') Reflect.deleteProperty(parent, String(last));
-    else Reflect.set(parent, String(last), value);
+    else Object.defineProperty(parent, String(last), { configurable: true, enumerable: true, writable: true, value });
   }
   return root;
 }
@@ -185,43 +187,73 @@ const requestsOf = (value: unknown): DesktopRequest[] => list(value).filter(isBa
 // with its `turnId` and app-server items).
 const turnsOf = (state: unknown): unknown[] => [...list(get(state, 'turns')), ...Object.values(bag(get(state, 'turnHistory', 'history', 'entitiesByKey')) || {})];
 
-/** What the owning window holds for a thread, as `watch` reports it. The turns are the owner's live objects: read them, keep nothing. */
-export interface LiveThread { requests: DesktopRequest[]; turns: unknown[] }
-
-// Follows one thread while `watch` is open: onChange({ requests, turns }) each time the owner's
-// state changes (often, while a reply is being written). Answers { close() }.
-function watch(conversationId: string, onChange: (live: LiveThread) => void, { sock = socketPath(), connect = net.createConnection, hostId = 'local', retryMs = 2000 }: WatchOptions = {}): Watcher {
-  const socket = connect(sock);
-  let buffer: Buffer = Buffer.alloc(0), clientId: unknown = null, revision: unknown = null, state: unknown = null, closed = false;
-  const initId = randomUUID();
-  const follow = (on: boolean) => clientId && !socket.destroyed && socket.write(frame({ type: 'broadcast', method: 'thread-stream-following-changed', sourceClientId: clientId, params: { conversationId, hostId, following: on }, version: FOLLOWING_VERSION }));
-  // The requests are copied: a card keeps its request after the owner's state has moved on.
-  const changed = () => onChange({ requests: requestsOf(structuredClone(get(state, 'requests'))), turns: turnsOf(state) });
-  // Until a snapshot comes (the desktop takes the thread on once it starts the turn), ask again.
-  const timer = setInterval(() => { if (revision == null) follow(true); }, retryMs);
-  timer.unref?.();
-  socket.on('error', () => {});
-  socket.on('connect', () => socket.write(frame({ type: 'request', requestId: initId, method: 'initialize', params: { clientType: 'desktop-bridge' }, version: 0 })));
-  socket.on('data', (chunk: Buffer) => {
-    buffer = frames(Buffer.concat([buffer, chunk]), message => {
-      if (refuseServing(socket, message)) return;
-      const type = get(message, 'type');
-      if (type === 'response' && get(message, 'requestId') === initId) { clientId = get(message, 'result', 'clientId'); follow(true); return; }
-      if (type !== 'broadcast' || get(message, 'method') !== 'thread-stream-state-changed' || get(message, 'params', 'conversationId') !== conversationId) return;
-      const change = get(message, 'params', 'change') || {};
-      const kind = get(change, 'type');
-      if (kind === 'snapshot') { revision = get(change, 'revision'); state = get(change, 'conversationState') || {}; changed(); }
-      else if (kind === 'patches') {
-        // Patches before the first snapshot are for the owner's other followers; the retry asks again.
-        if (revision == null) return;
-        if (get(change, 'baseRevision') !== revision) { revision = null; follow(true); return; }
-        revision = get(change, 'revision');
-        const patches = list(get(change, 'patches')).map((item): Patch => ({ op: get(item, 'op'), value: get(item, 'value'), path: list(get(item, 'path')) }));
-        if (patches.length) { state = applyPatches(state, patches) || {}; changed(); }
-      }
+export function plansOf(turns: unknown): DesktopTurn[] {
+  return list(turns).flatMap(turn => {
+    const id = get(turn, 'turnId');
+    if (typeof id !== 'string' || !id) return [];
+    const items = list(get(turn, 'items'));
+    const planItems = items.flatMap(item => {
+      const itemId = get(item, 'id'), text = get(item, 'text');
+      return get(item, 'type') === 'plan' && typeof itemId === 'string' && typeof text === 'string' ? [{ id: itemId, type: 'plan', text }] : [];
     });
+    const todo = items.findLast(item => get(item, 'type') === 'todo-list');
+    const plan = list(get(todo, 'plan')).flatMap((step): PlanItem[] => {
+      const content = get(step, 'step'), status = get(step, 'status');
+      return typeof content === 'string' ? [{ content, status: status === 'inProgress' || status === 'in_progress' ? 'in_progress' : status === 'completed' ? 'completed' : 'pending' }] : [];
+    });
+    if (!planItems.length && !plan.length) return [];
+    return [{ id, planItems, ...(plan.length ? { checklist: { id: `${id}:checklist`, type: 'todo-list', plan } } : {}) }];
   });
-  return { close() { if (closed) return; closed = true; clearInterval(timer); follow(false); setTimeout(() => socket.destroy(), 200).unref?.(); } };
+}
+
+export interface LiveThread { requests: DesktopRequest[]; turns: unknown[]; owner?: string | null }
+
+function watch(conversationId: string, onChange: (state: LiveThread) => void, { sock = socketPath(), connect = net.createConnection, hostId = 'local', retryMs = 2000 }: WatchOptions = {}): Watcher {
+  let socket: net.Socket | undefined, clientId: unknown, revision: unknown, owner: unknown;
+  let state: unknown = {}, closed = false;
+  const follow = (on: boolean) => clientId && socket && !socket.destroyed && socket.write(frame({ type: 'broadcast', method: 'thread-stream-following-changed', sourceClientId: clientId, params: { conversationId, hostId, following: on }, version: FOLLOWING_VERSION }));
+  const changed = () => onChange({ requests: requestsOf(structuredClone(get(state, 'requests'))), turns: turnsOf(state), owner: revision == null ? null : (typeof owner === 'string' ? owner : undefined) });
+  const reset = () => { revision = null; owner = null; state = {}; changed(); };
+  const join = () => {
+    const current = socket = connect(sock);
+    let buffer: Buffer = Buffer.alloc(0);
+    const initId = randomUUID();
+    current.on('error', () => {});
+    current.on('close', () => { socket = undefined; clientId = null; reset(); });
+    current.on('connect', () => current.write(frame({ type: 'request', requestId: initId, method: 'initialize', params: { clientType: 'desktop-bridge' }, version: 0 })));
+    current.on('data', (chunk: Buffer) => {
+      if (closed) return;
+      buffer = frames(Buffer.concat([buffer, chunk]), message => {
+        if (refuseServing(current, message)) return;
+        const type = get(message, 'type'), method = get(message, 'method'), params = get(message, 'params');
+        if (type === 'response' && get(message, 'requestId') === initId) { clientId = get(message, 'result', 'clientId'); follow(true); return; }
+        if (type !== 'broadcast') return;
+        if (method === 'ipc-connection-reset' || (owner && method === 'client-status-changed' && get(params, 'clientId') === owner && get(params, 'status') === 'disconnected')) { reset(); follow(true); return; }
+        if ((get(params, 'hostId') ?? 'local') !== hostId || get(params, 'conversationId') !== conversationId) return;
+        if (method === 'thread-stream-following-status-requested') { follow(true); return; }
+        if (method !== 'thread-stream-state-changed') return;
+        const change = get(params, 'change');
+        const source = get(message, 'sourceClientId');
+        if (get(change, 'type') === 'snapshot') {
+          owner = source;
+          revision = get(change, 'revision');
+          const snapshot = get(change, 'conversationState');
+          state = { requests: get(snapshot, 'requests'), turns: get(snapshot, 'turns'), turnHistory: get(snapshot, 'turnHistory') };
+          changed();
+        } else if (get(change, 'type') === 'patches' && revision != null && owner === source) {
+          if (get(change, 'baseRevision') !== revision) { reset(); follow(true); return; }
+          revision = get(change, 'revision');
+          const own = list(get(change, 'patches')).filter(item => ['requests', 'turns', 'turnHistory'].includes(String(get(item, 'path', 0))));
+          if (own.length) { state = applyPatches(state, own.map(item => ({ op: get(item, 'op'), path: get(item, 'path'), value: get(item, 'value') }))); changed(); }
+        }
+      });
+    });
+  };
+  // Rejoin if the desktop opens later. An owner that starts a turn can now supply a snapshot.
+  const timer = setInterval(() => { if (!socket) join(); else if (revision == null) follow(true); }, retryMs);
+  timer.unref?.();
+  join();
+  return { close() { if (closed) return; closed = true; clearInterval(timer); follow(false); const current = socket; current?.end(() => current.destroy()); } };
 }
 
 // Answers what the desktop asked for, through the window that owns the thread, as its own card does.

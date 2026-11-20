@@ -10,18 +10,21 @@ import { bag, get, list, messageOf, parseJson, str } from '../../shared/guards.j
 //   { "agents": { "claude": true, "antigravity": false }, "order": ["claude", "codex"],
 //     "custom": { "codex": { "label": "Blue", "idle": "codex-idle-3fa1c2d4e5.png" } } }
 export interface CustomChoice { label?: string; idle?: string; working?: string }
-interface Choices { agents: Map<string, boolean>; order: string[]; custom: Map<string, CustomChoice> }
+interface Choices { agents: Map<string, boolean>; order: string[]; custom: Map<string, CustomChoice>; read: Map<string, number> }
 const FIELDS = ['label', 'idle', 'working'] as const;
 class SettingsStore {
   file: string; private choices: Choices | null = null;
   constructor(file = '') { this.file = file; }
   private read(): Choices {
     if (this.choices) return this.choices;
-    const choices: Choices = { agents: new Map(), order: [], custom: new Map() };
+    const choices: Choices = { agents: new Map(), order: [], custom: new Map(), read: new Map() };
     // A missing or unreadable file is "nothing chosen yet"; an entry of the wrong shape is skipped.
     try {
       const saved = parseJson(fs.readFileSync(this.file, 'utf8'));
       for (const [id, on] of Object.entries(bag(get(saved, 'agents')) || {})) if (typeof on === 'boolean') choices.agents.set(id, on);
+      for (const [key, at] of Object.entries(bag(get(saved, 'read')) || {})) {
+        if (typeof at === 'number' && Number.isFinite(at) && at > 0) choices.read.set(key, at);
+      }
       choices.order = [...new Set(list(get(saved, 'order')).filter((id): id is string => typeof id === 'string' && !!id))];
       for (const [id, value] of Object.entries(bag(get(saved, 'custom')) || {})) {
         const custom: CustomChoice = {};
@@ -33,6 +36,15 @@ class SettingsStore {
   }
   /** The person's choice for this agent; undefined when they made none. */
   agent(id: string): boolean | undefined { return this.read().agents.get(id); }
+  readMarkers(): Record<string, number> { return Object.fromEntries(this.read().read); }
+  markRead(engine: string, id: string, at: number): number {
+    const key = JSON.stringify([engine, id]), markers = this.read().read;
+    const previous = markers.get(key) || 0;
+    if (at <= previous) return previous;
+    markers.set(key, at);
+    this.write();
+    return at;
+  }
   /** Records the choice. A file that cannot be written keeps the choice until the server stops. */
   setAgent(id: string, on: boolean): void { this.read().agents.set(id, on); this.write(); }
   /** The rail's order as the person set it (agents they never placed are not in it). */
@@ -49,13 +61,14 @@ class SettingsStore {
   }
   private write(): void {
     if (!this.file) return;
-    const { agents, order, custom } = this.read();
+    const { agents, order, custom, read } = this.read();
     try {
       let kept: Record<string, unknown> = {};
       try { kept = { ...bag(parseJson(fs.readFileSync(this.file, 'utf8'))) }; } catch {}
       // Only what was chosen is written: a file of switches alone stays { "agents": … }.
       delete kept['order']; delete kept['custom'];
-      const next = { ...kept, agents: Object.fromEntries(agents), ...(order.length ? { order } : {}), ...(custom.size ? { custom: Object.fromEntries(custom) } : {}) };
+      const next = { ...kept, agents: Object.fromEntries(agents), ...(order.length ? { order } : {}), ...(custom.size ? { custom: Object.fromEntries(custom) } : {}),
+        ...(read.size ? { read: Object.fromEntries(read) } : {}) };
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       const draft = `${this.file}.${process.pid}.tmp`;
       fs.writeFileSync(draft, `${JSON.stringify(next, null, 2)}\n`);

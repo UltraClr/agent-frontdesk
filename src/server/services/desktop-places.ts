@@ -174,13 +174,13 @@ type Runner = (file: string, args: string[], options: { timeout: number; windows
  * (url.dll's FileProtocolHandler, the same as typing it into Run), with no cmd.exe in between,
  * so `&` and quotes in the link need no escaping. Whether the app then comes forward is the app's.
  */
-export function linkCommand(link: string, { platform = process.platform }: PlaceOptions = {}): [string, string[]] {
-  if (platform === 'darwin') return ['/usr/bin/open', ['-g', link]];
+export function linkCommand(link: string, { platform = process.platform, foreground = false }: PlaceOptions & { foreground?: boolean } = {}): [string, string[]] {
+  if (platform === 'darwin') return ['/usr/bin/open', foreground ? [link] : ['-g', link]];
   if (platform === 'win32') return ['rundll32.exe', ['url.dll,FileProtocolHandler', link]];
   return ['xdg-open', [link]];
 }
-export function openLink(link: string, { platform = process.platform, run = execFile as unknown as Runner }: PlaceOptions & { run?: Runner } = {}): Promise<void> {
-  const [file, args] = linkCommand(link, { platform });
+export function openLink(link: string, { platform = process.platform, foreground = false, run = execFile as unknown as Runner }: PlaceOptions & { foreground?: boolean; run?: Runner } = {}): Promise<void> {
+  const [file, args] = linkCommand(link, { platform, foreground });
   return new Promise((resolve, reject) => { run(file, args, { timeout: 15000, windowsHide: true }, err => err ? reject(err) : resolve()); });
 }
 
