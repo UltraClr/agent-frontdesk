@@ -141,6 +141,40 @@ test('mixed agents can join as fresh or existing members and only a recipient ge
   assert.match(must(fixture.sent[2]?.prompt), /Check/);
 });
 
+test('verified new group chats get native titles even when creation ignored the supplied title', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const create = fixture.codex.create;
+  fixture.codex.create = input => create({ ...input, title: 'Desktop-generated title' });
+  const names: Array<{ sessionId: string; title: string }> = [];
+  must(fixture.codex.coordinator).nameNewSession = (sessionId, title) => {
+    names.push({ sessionId, title });
+    must(must(fixture.histories.get('codex:' + sessionId)).session).title = title;
+  };
+  const { id } = await groups.create(fixture.codex, { key: 'native-names', name: 'Review', members: [
+    { engine: 'codex', newSession: true, alias: 'Reviewer' },
+  ] });
+  await groups.poll();
+  const hostId = must(groups.view(id).sessionId);
+  assert.deepEqual(names, [{ sessionId: hostId, title: '「群聊」Review' }]);
+
+  // Recovery must use the same naming path when desktop creation ran but the response was lost.
+  const createUnnamed = fixture.codex.create;
+  fixture.codex.create = async input => { await createUnnamed(input); throw new Error('Desktop creation response lost'); };
+  groups.send(id, { key: 'question', member: 'Reviewer', text: 'Review this' });
+  await groups.poll();
+  groups = await fixture.reopen();
+  await groups.poll(); await groups.poll();
+  const memberId = must(groups.view(id).members[0]?.sessionId);
+  assert.deepEqual(names, [
+    { sessionId: hostId, title: '「群聊」Review' },
+    { sessionId: memberId, title: '「Review」Reviewer' },
+  ]);
+  await groups.poll();
+  assert.equal(names.length, 2);
+  assert.equal(fixture.created.length, 2);
+});
+
 test('a lost native creation response recovers the original dedicated chat without creating again', async t => {
   const fixture = setup(t);
   let groups = await fixture.reopen();

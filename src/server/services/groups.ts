@@ -660,6 +660,11 @@ export class Groups {
     return this.view(id);
   }
 
+  private async nameNewSession(engine: Engine, id: string, title: string) {
+    try { await engine.coordinator?.nameNewSession?.(id, title); }
+    catch (error) { console.warn('Could not set the new group chat title', engine.id, messageOf(error)); }
+  }
+
   private async bindHost(room: GroupRecord, engine: Engine, preferred?: string) {
     const catalog = preferred ? [{ id: preferred, cwd: room.directory, updatedAt: Date.now() }] : await engine.coordinator!.catalog(room.directory);
     const hits: string[] = [];
@@ -674,10 +679,15 @@ export class Groups {
       if (this.stopped) return;
     }
     if (hits.length !== 1) return;
+    const id = hits[0]!;
+    const opening = this.record(room.id);
+    if (opening.state !== 'confirming') return;
+    await this.nameNewSession(engine, id, `「群聊」${opening.name}`);
+    if (this.stopped) return;
     this.transaction(() => {
       const current = this.record(room.id);
       if (current.state !== 'confirming') return;
-      current.sessionId = hits[0]!;
+      current.sessionId = id;
       current.state = 'ready';
       this.setRoom(current);
     });
@@ -1217,15 +1227,24 @@ export class Groups {
       } catch { /* A newly returned native ID can precede durable history. */ }
     }
     if (this.stopped || hits.length !== 1) return;
+    const session = hits[0]!;
+    const creating = this.activeWork(work.id);
+    if (!creating) return;
+    const room = this.record(creating.groupId);
+    const member = workMember(room, creating);
+    if (!member || member.sessionId) return;
+    const titlePrefix = creating.nativeTitlePrefix || (adapter.nameNewSession ? `「${room.name}」` : undefined);
+    if (titlePrefix && !creating.formerMember && adapter.nameNewSession) await this.nameNewSession(engine, session.id, titlePrefix + member.alias);
+    if (this.stopped) return;
     this.transaction(() => {
       const live = this.activeWork(work.id);
       if (!live) return;
       const room = this.record(live.groupId);
       const stored = workMember(room, live);
       if (!stored || stored.sessionId) return;
-      stored.sessionId = hits[0]!.id;
-      if (live.nativeTitlePrefix) stored.nativeTitlePrefix = live.nativeTitlePrefix;
-      stored.nativeSettings = nativeSettings(hits[0]!);
+      stored.sessionId = session.id;
+      if (titlePrefix) stored.nativeTitlePrefix = titlePrefix;
+      stored.nativeSettings = nativeSettings(session);
       live.target = stored.sessionId;
       live.note = '';
       if (!requiresPrompt && live.formerMember) {

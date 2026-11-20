@@ -117,7 +117,7 @@ Create a group from the coordinator sidebar or ask your coordinator to group the
 
 Use **Manage members** to add existing chats, set up dedicated members, or remove members after creating the group. Choose a member as the recipient to ask it directly. Choose the host for a multi-step discussion or summary. A decision links back to its native turn and can be reported explicitly to the current coordinator.
 
-Frontdesk labels the coordinator with `[Coordinator]`, group hosts with `[Group]`, and dedicated members with the group name. Search the session list by group name or label. Existing chats added as ordinary members keep their titles. Desktop apps control their own titles.
+Frontdesk labels the coordinator with `[Coordinator]`, group hosts with `[Group]`, and dedicated members with the group name. Search the session list by group name or label. Frontdesk also sets desktop titles for newly created Codex group hosts and dedicated members after verifying the native chat. Existing chats added as ordinary members keep their titles.
 
 The host continues in its own desktop chat. Ask it to consider member replies when needed, or use **Reply to this** to include a specific excerpt. Members receive their assigned question and relevant excerpts. If the same native chat participates in two groups, it remembers the tasks it received from both.
 

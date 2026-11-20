@@ -229,7 +229,7 @@ class CodexBridge extends EventEmitter {
   }
 
   // One JSON-RPC request to the app-server; answers its whole response message.
-  send(method: string, params: unknown = {}): Promise<unknown> {
+  send(method: string, params: unknown = {}, timeoutMs = 30_000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const proc = this.proc;
       if (!proc || proc.killed) {
@@ -241,7 +241,7 @@ class CodexBridge extends EventEmitter {
           this.pending.delete(id);
           reject(Object.assign(new Error(`Timeout waiting for response to ${method}`), { transport: true }));
         }
-      }, 30000);
+      }, timeoutMs);
 
       this.pending.set(id, (msg) => {
         clearTimeout(timer);
@@ -649,6 +649,12 @@ class CodexBridge extends EventEmitter {
   async readThread(threadId: string, includeTurns = false): Promise<unknown> {
     await this.start();
     return get(await this.send('thread/read', { threadId, includeTurns }), 'result', 'thread') || {};
+  }
+
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    await this.start();
+    // A missing title must not hold up the group's first dispatch.
+    await this.send('thread/name/set', { threadId, name }, 5_000);
   }
 
   // The link opens a desktop-owned draft. It never sends text. Frontdesk binds only after

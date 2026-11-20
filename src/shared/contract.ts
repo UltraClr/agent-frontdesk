@@ -275,6 +275,8 @@ export interface CoordinatorAdapter {
   };
   /** Opens the workspace with a setup draft when the desktop cannot expose an empty session ID. */
   prepare?(cwd: string, prompt: string): Awaitable<void>;
+  /** Applies the requested title to a verified new group chat when native creation cannot name it. */
+  nameNewSession?(id: string, title: string): Awaitable<void>;
   /** Selects the native default when the desktop requires an explicit model on creation. */
   defaultModel?(): Awaitable<string>;
   /** Desktop catalog metadata only. A cwd restricts recovery to one project. */

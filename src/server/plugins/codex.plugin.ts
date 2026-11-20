@@ -82,6 +82,7 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
     look: { worked: 'fold', workingLive: true, toolCaption: 'kinds', diffCard: true, userTime: false, replyTime: 'none' },
     usage: () => bridge.getUsage(),
     coordinator: { groupProject: true, groupMember: {}, ...(config.codexHome ? { root: config.codexHome } : {}), prepare: (cwd, prompt) => bridge.prepareCoordinator(cwd, prompt),
+      nameNewSession: (id, title) => bridge.setThreadName(id, title),
       catalog: cwd => bridge.coordinationCatalog(cwd),
       read: async id => {
         try { return await bridge.getThread(id); }
