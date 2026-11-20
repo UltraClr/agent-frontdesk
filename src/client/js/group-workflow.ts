@@ -156,8 +156,10 @@ export class GroupWorkflowDialog {
       status.textContent = view.entries.length ? '' : t('等待本次任务的结果');
       const markup = view.entries.map(item => {
         const message = item.message, delivery = item.delivery;
-        const state = item.pending ? t(planned[item.pending]) : delivery?.outcome ? t(outcomes[delivery.outcome])
-          : delivery?.state === 'sent' && !delivery.nativeTurn ? t('正在确认桌面记录') : delivery ? t(pending[delivery.state]) : '';
+        const state = item.pending ? planned[item.pending] : delivery?.outcome ? outcomes[delivery.outcome]
+          : delivery?.awaitingOutcome ? '正在确认原生轮次结果'
+            : delivery?.state === 'sent' && !delivery.nativeTurn ? '正在确认桌面记录'
+              : delivery?.state === 'queued' && delivery.note ? '群任务受阻' : delivery ? pending[delivery.state] : '';
         const usable = hasOutput(item);
         return `<article class="group-result-card"><header><strong>${escape(labelOf(item))}</strong>
           <span class="group-state-pill" data-tone="${usable ? 'positive' : 'neutral'}">${t(state)}</span>

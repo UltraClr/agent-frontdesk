@@ -215,6 +215,65 @@ test('two proposals show the result that arrives first and keep failures unaccep
   assert.equal(groups.progress(id)?.state, 'partial');
 });
 
+test('a quoted member revision returns to the same task result card and can be adopted', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'result-revision');
+  await groups.poll();
+  const input = { template: 'proposals', members: groups.view(id).members.slice(0, 2).map(item => item.enrollmentId),
+    material: 'One brief', criteria: 'Two independent proposals' };
+  const preview = groups.previewTemplate(id, input);
+  const task = must(groups.startTemplate(id, { ...input, version: preview.version, key: 'proposals' }).task);
+  await groups.poll(); await groups.poll();
+  fixture.finish(0, 'Original proposal A');
+  fixture.finish(1, 'Original proposal B');
+  await groups.poll();
+  const original = must(groups.results(id, task.id, task.revision).entries[0]?.message);
+  groups.send(id, { key: 'revise', member: original.author, replyTo: original.id, text: 'Add the cost estimate' });
+  await groups.poll(); await groups.poll();
+  assert.match(must(fixture.sent[2]).prompt, /Original proposal A/);
+  fixture.finish(2, 'Revised proposal including cost estimate');
+  await groups.poll();
+  const revised = must(groups.results(id, task.id, task.revision).entries.find(item => item.message?.text.includes('including cost estimate'))?.message);
+  assert.equal(revised.taskId, task.id);
+  assert.equal(revised.taskRevision, task.revision);
+  groups.adoptResult(id, { taskId: task.id, revision: task.revision, messageId: revised.id, adopted: true });
+  groups = await fixture.reopen();
+  const card = groups.results(id, task.id, task.revision);
+  assert.equal(card.entries.find(item => item.message?.id === revised.id)?.adopted, true);
+  assert.equal(card.entries.find(item => item.message?.id === original.id)?.adopted, false);
+  assert.equal(card.entries.length, 3);
+});
+
+test('the inbox shows preflight blocks and confirmed native turns with unconfirmed outcomes', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'delivery-inbox');
+  await groups.poll();
+  fixture.dsh.blocked = target => target === 'B' ? 'Test quota exhausted' : undefined;
+  groups.send(id, { key: 'quota', text: 'Check quota block', member: 'B' });
+  groups.send(id, { key: 'receipt', text: 'Check native outcome', member: 'A' });
+  await groups.poll(); await groups.poll();
+  const blocked = must(groups.view(id).deliveries.find(item => item.target === 'B'));
+  const running = must(groups.view(id).deliveries.find(item => item.target === 'A'));
+  assert.equal(blocked.state, 'queued');
+  assert.deepEqual(groups.inbox().flatMap(item => item.kind === 'delivery' ? [[item.operationId, item.title]] : []),
+    [[blocked.id, 'Test quota exhausted']]);
+  const sent = must(fixture.sent[0]), history = must(fixture.histories.get(sent.target));
+  history.turns.push(new UnifiedTurn({ id: 'pending-native', status: 'unknown', userPrompt: sent.prompt }));
+  await groups.poll();
+  groups = await fixture.reopen(true);
+  await groups.poll();
+  const found = groups.inbox().find(item => item.kind === 'delivery' && item.operationId === running.id);
+  assert.equal(found?.title, '正在确认原生轮次结果');
+  assert.equal(found?.turnId, 'pending-native');
+  fixture.dsh.blocked = () => undefined;
+  history.turns[0] = turn('pending-native', sent.prompt, 'Native record confirmed');
+  await groups.poll(); await groups.poll();
+  assert.equal(groups.inbox().length, 0);
+  assert.deepEqual(fixture.sent.map(item => item.target), ['dsh:A', 'dsh:B']);
+});
+
 test('mixed agents can join as fresh or existing members and only a recipient gets a native chat', async t => {
   const fixture = setup(t);
   let groups = await fixture.reopen();
@@ -753,6 +812,49 @@ test('removing an unrelated member preserves the assigned discussion and an in-f
   await groups.poll();
   assert.deepEqual(fixture.sent.map(message => message.target), [host, 'dsh:A', 'dsh:B', host]);
   assert.deepEqual(groups.decisions(id).map(message => message.text), ['Both checks passed']);
+});
+
+test('removing a participant invalidates pending parallel work and preserves native results', async t => {
+  for (const stage of ['planning', 'running', 'summary queued'] as const) await t.test(stage, async t => {
+    const fixture = setup(t);
+    let groups = await fixture.reopen();
+    const { id } = await fixture.create(fixture.codex, 'parallel-removal');
+    await groups.poll();
+    groups.send(id, { key: 'task', text: 'Collect two independent proposals and summarize', allowParallel: true });
+    await groups.poll();
+    const remove = () => groups.changeMembers(id, { remove: [{ engine: 'dsh', id: 'B' }] });
+    if (stage === 'planning') await remove();
+    fixture.finish(0, groupAction({ action: 'collect', mode: 'parallel', summarize: true,
+      questions: [{ member: 'A', text: 'One' }, { member: 'B', text: 'Two' }] }));
+    await groups.poll(); await groups.poll();
+    if (stage === 'planning') {
+      assert.equal(groups.progress(id)?.state, 'paused');
+      assert.equal(fixture.sent.length, 1, 'a stale proposal never falls back to a serial dispatch');
+      return;
+    }
+    assert.deepEqual(fixture.sent.slice(1).map(item => item.target), ['dsh:A', 'dsh:B']);
+    fixture.finish(2, 'B finishes before removal');
+    await groups.poll();
+    if (stage === 'summary queued') {
+      fixture.codex.blocked = () => 'Host temporarily unavailable';
+      fixture.finish(1, 'A finishes before removal');
+      await groups.poll(); await groups.poll();
+      assert.equal(groups.progress(id)?.deliveries.at(-1)?.state, 'queued');
+      assert.equal(groups.progress(id)?.deliveries.at(-1)?.kind, 'host');
+    }
+    await remove();
+    groups = await fixture.reopen(true);
+    if (stage === 'running') fixture.finish(1, 'A returns after removal');
+    fixture.codex.blocked = () => undefined;
+    await groups.poll(); await groups.poll();
+    const task = must(groups.progress(id));
+    assert.equal(task.state, 'paused');
+    assert.equal(fixture.sent.length, 3, 'no automatic summary is sent');
+    const results = groups.results(id, task.id, task.revision).entries;
+    assert.equal(results.find(item => item.label === 'B')?.message?.text, 'B finishes before removal');
+    assert.match(results.find(item => item.label === 'A')?.message?.text || '', /^A (returns|finishes)/);
+    assert.equal(groups.view(id).pending, 0);
+  });
 });
 
 test('a plan pauses at the removed enrollment even when its alias or native chat is reused', async t => {

@@ -38,3 +38,28 @@ test('inbox discovers lazily, merges native requests across sources and keeps la
   const resolved = await inbox.read();
   assert.equal(resolved.items.some(item => item.engine === 'codex'), false);
 });
+
+test('a newer exact request supersedes a stale request in the same native session', async t => {
+  for (const coarse of [false, true]) await t.test(coarse ? 'after a session-level flag' : 'from one exact request to the next', async () => {
+    const host = new PluginHost();
+    const a = { sessionId: 'one', kind: 'approval' as const, requestId: 'A' };
+    const b = { sessionId: 'one', kind: 'approval' as const, requestId: 'B' };
+    let native: NativePendingRequest[] = [a];
+    let offline = false;
+    host.register({ ...required, id: 'dsh', label: 'DSH', capabilities: {}, list: () => [],
+      listWaiting: () => { if (offline) throw new Error('Offline'); return native; } });
+    const inbox = new Inbox(host, () => [{ ...a, engine: 'dsh', source: { href: '#group/one', title: 'Group' } }]);
+    assert.deepEqual((await inbox.read()).items.map(item => item.requestId), ['A']);
+    if (coarse) {
+      native = [{ sessionId: a.sessionId, kind: a.kind }];
+      assert.deepEqual((await inbox.read()).items.map(item => item.requestId), ['A'], 'a coarse flag is not a resolution');
+    }
+    native = [b];
+    assert.deepEqual((await inbox.read()).items.map(item => item.requestId), ['B']);
+    offline = true;
+    assert.deepEqual((await inbox.read()).items.map(item => item.requestId), ['B'], 'disconnect does not resurface the resolved request');
+    offline = false;
+    native = [];
+    assert.deepEqual((await inbox.read()).items, []);
+  });
+});

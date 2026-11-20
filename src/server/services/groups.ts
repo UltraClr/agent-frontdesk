@@ -273,14 +273,15 @@ export class Groups {
   results(id: string, taskId: string, revision: number): GroupResults {
     const room = this.record(id);
     const task = this.findMessage(id, taskId);
-    const works = this.taskWork(id, taskId).filter(work => hosted(work) && taskRevision(work) === revision);
+    const works = this.taskWork(id, taskId).filter(work => taskRevision(work) === revision &&
+      (hosted(work) || (work.kind === 'member' && work.taskId === taskId)));
     if (!task || task.kind !== 'user' || !works.length) throw failure('群任务结果不存在', { status: 404 });
     const picked = this.store().prepare('SELECT 1 FROM group_adoptions WHERE room=? AND message=?');
     const entries = works.flatMap<GroupResults['entries'][number]>(work => {
       const message = this.findMessage(id, work.id + '/reply');
       if (work.kind === 'host' && !message?.decision && work.state === 'done' && !work.summaryOnly) return [];
       return [{
-        id: work.id, engine: work.engine, label: work.kind === 'host' ? '' : workMember(room, work)?.alias || work.engine,
+        id: work.id, engine: work.engine, label: work.kind === 'host' ? '' : workMember(room, work)?.alias || message?.author || work.engine,
         message, delivery: this.delivery(room, work, taskId),
         adopted: !!(message && picked.get(id, message.id)),
       }];
@@ -312,8 +313,10 @@ export class Groups {
 
   inbox(): InboxSignal[] {
     const rows = this.store().prepare(`SELECT w.data, r.data AS room FROM group_work w JOIN rooms r ON r.id=w.room
-      WHERE w.state IN ('waiting','blocked') OR (w.state='sent' AND json_extract(w.data,'$.nativeTurn') IS NULL
-      AND json_extract(w.data,'$.dispatched') <= ?)`).all(Date.now() - 60_000);
+      WHERE w.state IN ('waiting','blocked')
+      OR (w.state='queued' AND json_extract(w.data,'$.note') <> '')
+      OR (w.state='sent' AND (json_extract(w.data,'$.awaitingOutcome')=1 OR
+        (json_extract(w.data,'$.nativeTurn') IS NULL AND json_extract(w.data,'$.dispatched') <= ?)))`).all(Date.now() - 60_000);
     return rows.flatMap<InboxSignal>(row => {
       const room = JSON.parse(String(row.room)) as GroupRecord;
       const work = this.delivery(room, JSON.parse(String(row.data)) as Work);
@@ -323,10 +326,11 @@ export class Groups {
       if (work.state === 'waiting' && work.attention && signal.sessionId) return [{
         ...signal, sessionId: signal.sessionId, requestId: work.attention.id, title: work.attention.title, kind: work.attention.kind || 'approval',
       } satisfies InboxSignal];
-      if (work.state === 'blocked' || (work.state === 'sent' && !work.nativeTurn)) return [{
-        ...signal, kind: 'delivery', operationId: work.id, title: work.note,
-      } satisfies InboxSignal];
-      return [];
+      if (work.state === 'waiting') return [];
+      return [{
+        ...signal, kind: 'delivery', operationId: work.id,
+        title: work.note || (work.awaitingOutcome ? '正在确认原生轮次结果' : ''),
+      }];
     });
   }
 
@@ -638,6 +642,21 @@ export class Groups {
       const roster = rosterOf(room);
       const removedEnrollments = new Set(removed.map(enrollmentOf));
       room.task ??= this.roomTask(room);
+      let stopParallel = false;
+      // Keep completed participants in scope until their parallel batch has sent its optional summary.
+      if (removed.length && room.task?.state === 'open') {
+        const current = this.taskWork(room.id, room.task.id).filter(work => this.currentTask(room, work));
+        const pendingBatches = new Set(current.filter(work => work.state !== 'done').map(work => work.parallelBatch));
+        const unsentSources = new Set(current.filter(work => work.summaryOnly &&
+          (work.state === 'queued' || memberCreationRefused(work))).flatMap(work => work.sources || []));
+        const finished = current.find(work => work.state === 'done' && work.parallelBatch && work.enrollment &&
+          removedEnrollments.has(work.enrollment) && (pendingBatches.has(work.parallelBatch) || unsentSources.has(work.id + '/reply')));
+        const member = finished && workMember(room, finished);
+        if (finished && member) {
+          this.pauseMemberPlan(room, finished, member.alias, finished.question);
+          stopParallel = true;
+        }
+      }
       const workRows = this.store().prepare("SELECT data FROM group_work WHERE room=? AND state<>'done'").all(id);
       for (const row of workRows) {
         const work = JSON.parse(String(row.data)) as Work;
@@ -654,15 +673,17 @@ export class Groups {
         const member = workMember(room, work);
         if (!member || !removedEnrollments.has(enrollmentOf(member))) continue;
         work.formerMember = member;
-        if (work.automated) this.pauseMemberPlan(room, work, member.alias, work.question, work.batch?.[0]?.member);
+        if (work.automated) {
+          stopParallel ||= !!(work.parallelBatch && this.currentTask(room, work));
+          this.pauseMemberPlan(room, work, member.alias, work.question, work.batch?.[0]?.member);
+        }
         if (work.state === 'queued' || memberCreationRefused(work)) {
           this.withdrawMemberWork(room, work);
         } else {
           this.updateWork(work);
         }
       }
-      if (room.task?.state === 'paused' && this.taskWork(room.id, room.task.id).some(work =>
-        work.parallelBatch && work.formerMember && taskRevision(work) === room.task!.revision)) this.finishUnsent(room, room.task.id);
+      if (stopParallel && room.task) this.finishUnsent(room, room.task.id);
       room.members = [...retained, ...added];
       room.updated = Date.now();
       this.setRoom(room);
@@ -1259,8 +1280,11 @@ export class Groups {
     }
     this.append(room, { ...base, text: reply.slice(0, structure?.index).trim() || batch.map(item => '@' + item.member + ' ' + item.text).join('\n') });
     const resume = type === 'ask' || get(action, 'summarize') === true;
-    if (type === 'collect' && task.allowParallel && get(action, 'mode') === 'parallel' && batch.length === 2 &&
-      this.startParallel(room, work, batch, base.id, resume)) return;
+    if (type === 'collect' && task.allowParallel && get(action, 'mode') === 'parallel' && batch.length === 2) {
+      const removed = batch.find(step => !room.members.some(member => enrollmentOf(member) === step.enrollment));
+      if (removed) { this.pauseMemberPlan(room, work, removed.member, base.id); return; }
+      if (this.startParallel(room, work, batch, base.id, resume)) return;
+    }
     this.nextMember(room, work, batch, base.id, resume);
   }
 

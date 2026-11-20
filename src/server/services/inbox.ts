@@ -6,8 +6,16 @@ const sessionKey = (item: { engine: string; sessionId?: string }) => JSON.string
 const requestKey = (item: { engine: string; sessionId?: string; requestId?: string }) =>
   JSON.stringify([sessionKey(item), item.requestId]);
 
+interface NativeCheck {
+  requests: NativePendingRequest[];
+  known: Map<string, NativePendingRequest>;
+  resolved: Set<string>;
+  checkedAt: number;
+  offline: boolean;
+}
+
 export class Inbox {
-  private readonly native = new Map<Engine, { requests: NativePendingRequest[]; checkedAt: number; offline: boolean; resolved: Set<string> }>();
+  private readonly native = new Map<Engine, NativeCheck>();
   private readonly firstSeen = new Map<string, number>();
   private pending?: Promise<InboxView>;
 
@@ -26,18 +34,26 @@ export class Inbox {
       const previous = this.native.get(engine);
       try {
         const requests = await engine.listWaiting();
-        const key = (item: NativePendingRequest) => requestKey({ ...item, engine: engine.id });
-        const current = new Set(requests.map(key));
+        const current = new Map(requests.filter(item => item.requestId)
+          .map(item => [requestKey({ ...item, engine: engine.id }), item]));
+        const coarse = new Set(requests.filter(item => !item.requestId).map(item => item.sessionId));
+        const known = new Map(previous?.known);
         const resolved = new Set(previous?.resolved);
-        for (const item of previous?.requests || []) {
-          if (item.requestId && !current.has(key(item)) && !requests.some(request => request.sessionId === item.sessionId)) resolved.add(key(item));
+        // A session-level flag cannot prove which request ended. An exact replacement can.
+        for (const [id, item] of known) {
+          if (current.has(id) || coarse.has(item.sessionId)) continue;
+          resolved.add(id);
+          known.delete(id);
         }
-        for (const id of current) resolved.delete(id);
+        for (const [id, item] of current) {
+          known.set(id, item);
+          resolved.delete(id);
+        }
         while (resolved.size > 512) resolved.delete(resolved.values().next().value!);
-        this.native.set(engine, { requests, checkedAt: Date.now(), offline: false, resolved });
+        this.native.set(engine, { requests, known, resolved, checkedAt: Date.now(), offline: false });
       } catch {
         this.native.set(engine, { requests: previous?.requests || [], checkedAt: previous?.checkedAt || 0,
-          offline: true, resolved: previous?.resolved || new Set() });
+          offline: true, known: previous?.known || new Map(), resolved: previous?.resolved || new Set() });
       }
     }));
     const byEngine = new Map(engines.filter(engine => this.host.engines.get(engine.id) === engine).map(engine => [engine.id, engine]));
@@ -46,8 +62,9 @@ export class Inbox {
       if (!engine) return false;
       if (item.kind === 'delivery') return true;
       const native = this.native.get(engine);
-      if (!native || native.offline) return true;
-      return item.requestId ? !native.resolved.has(requestKey(item)) : native.requests.some(request => request.sessionId === item.sessionId);
+      if (!native) return true;
+      if (item.requestId) return !native.resolved.has(requestKey(item));
+      return native.offline || native.requests.some(request => request.sessionId === item.sessionId);
     });
     for (const engine of byEngine.values()) {
       for (const item of this.native.get(engine)?.requests || []) signals.push({ ...item, engine: engine.id });
