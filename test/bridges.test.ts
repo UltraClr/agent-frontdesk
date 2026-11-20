@@ -405,6 +405,43 @@ function antigravityFixture(steps: object[], { idle = 1, inputIndex = 0, t }: { 
 const agyStep = (type: string, status: string, body: object = {}, meta: object = {}) => ({ type: `CORTEX_STEP_TYPE_${type}`, status: `CORTEX_STEP_STATUS_${status}`, metadata: { createdAt: '2026-11-11T17:02:07Z', ...meta }, ...body });
 const agyFatal = agyStep('ERROR_MESSAGE', 'DONE', { errorMessage: { shouldShowUser: true, error: { userErrorMessage: 'Agent execution terminated due to error.', shortError: 'unknown model key M8' } } });
 
+test('Antigravity confirms a marked first turn even when the summary stores input index -1', async t => {
+  const marker = '[Frontdesk · group/first]';
+  const { bridge } = antigravityFixture([
+    agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: marker + '\nReview the draft' } }),
+    agyStep('PLANNER_RESPONSE', 'DONE', { plannerResponse: { response: 'First-turn reply' } }),
+  ], { inputIndex: -1, t });
+  const { turns } = await bridge.coordinationHistory('c1', { marker, turnId: 'turn-0' });
+  assert.equal(turns[0]?.statusEvidence, 'desktop_trajectory');
+  assert.equal(turns[0]?.assistantReply, 'First-turn reply');
+  const unrelated = await bridge.coordinationHistory('c1', { marker: '[Frontdesk · group/different]' });
+  assert.equal(unrelated.turns[0]?.statusEvidence, null);
+});
+
+test('Antigravity confirms a group receipt within its own native input bounds', async t => {
+  const marker = '[Frontdesk · group/old]';
+  const steps = [
+    agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: marker + '\nReview the draft' } }),
+    agyStep('PLANNER_RESPONSE', 'DONE', { plannerResponse: { response: 'Review for the group' } }),
+    agyStep('USER_INPUT', 'DONE', { userInput: { userResponse: 'Private follow-up' } }),
+    agyFatal,
+  ];
+  const { bridge } = antigravityFixture(steps, { inputIndex: 2, t });
+  const receipt = { marker, turnId: 'turn-0' };
+  const { turns } = await bridge.coordinationHistory('c1', receipt);
+  assert.equal(turns[0]?.status, 'completed');
+  assert.equal(turns[0]?.statusEvidence, 'desktop_trajectory');
+  assert.equal(turns[0]?.assistantReply, 'Review for the group');
+  assert.equal(turns[1]?.status, 'failed');
+
+  // A tool step followed by a private turn provides no terminal outcome for the group.
+  const second = antigravityFixture([
+    steps[0]!, agyStep('GENERIC', 'DONE'), steps[2]!, steps[3]!,
+  ], { inputIndex: 2, t });
+  const unresolved = await second.bridge.coordinationHistory('c1', receipt);
+  assert.equal(unresolved.turns[0]?.statusEvidence, null);
+});
+
 test('Antigravity displays a native quota limit live and after reload even when the transcript omitted it', async t => {
   const message = 'Individual quota reached. Resets in 3h53m38s.';
   const report = agyStep('ERROR_MESSAGE', 'DONE', {

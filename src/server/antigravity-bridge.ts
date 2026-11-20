@@ -23,6 +23,7 @@ import { loadConfig, winSpawnArgs } from './config.js';
 import { tailJsonl } from './services/jsonl-tail.js';
 import { readSqlite } from './services/sqlite-reader.js';
 import { DesktopAutomation, type HelperResult } from './core/desktop-automation.js';
+import { promptStarts } from '../shared/turn-match.js';
 import { bag, errorField, get, isBag, list, messageOf, parseJson, str, text as asText, type Bag } from '../shared/guards.js';
 import type {
   Approval, BridgeConfig, CreateInput, CreateResult, DictationHandlers, DictationReady, DictationStream, EngineEmitter, EngineStatus,
@@ -128,6 +129,15 @@ function errorText(error: unknown): string {
   const shown = str(get(error, 'userErrorMessage'))?.trim();
   if (shown && quotaError(error)) return shown;
   return [shown, get(error, 'shortError')].filter(Boolean).join(' ').trim() || 'Agent execution terminated due to error.';
+}
+function outcomeOfSteps(steps: unknown[], requireSettled: boolean): Outcome | null {
+  // A settled tool or a system notice on its own is not an end-of-turn result.
+  const last = steps.filter(step => stepKind(step) !== 'EPHEMERAL_MESSAGE').at(-1);
+  if (!last || (requireSettled && !SETTLED.has(stepStatus(last)))) return null;
+  const error = shownError(last);
+  if (error) return { status: 'failed', error: { message: errorText(error) } };
+  if (['CANCELED', 'INTERRUPTED'].includes(stepStatus(last))) return { status: 'interrupted' };
+  return ['PLANNER_RESPONSE', 'NOTIFY_USER'].includes(stepKind(last)) ? { status: 'completed' } : null;
 }
 function recordFailure(turn: UnifiedTurn, record: AgRecord): void {
   const detail = String(record.content || record.error || '').replace(/^Error:\s*/, '').slice(0, 4000);
@@ -693,15 +703,28 @@ class AntigravityBridge extends EventEmitter {
     return { session, turns };
   }
 
-  async coordinationHistory(id: string) {
-    const history = await this.getConversationHistory(id), turn = history.turns.at(-1);
+  async coordinationHistory(id: string, receipt?: { marker: string; turnId?: string | null }) {
+    const history = await this.getConversationHistory(id);
+    const latest = history.turns.at(-1);
+    const turn = receipt ? history.turns.find(item => (!receipt.turnId || item.id === receipt.turnId) &&
+      promptStarts(item.userPrompt, receipt.marker)) : latest;
     if (!turn || turn.statusEvidence) return history;
     const row = this.row(id);
-    if (!row || Number(row['not_fully_idle']) !== 0) return history;
-    const edge = Number(row['last_user_input_step_index']);
-    if (!Number.isInteger(edge) || turn.id !== `turn-${edge}`) return history;
-    const outcome = await this.turnOutcome(id, row, { requireSettled: true });
-    if (outcome) Object.assign(turn, { status: outcome.status, statusEvidence: 'desktop_trajectory' });
+    const input = /^turn-(\d+)$/.exec(turn.id)?.[1];
+    const historical = turn !== latest;
+    if (!row || input == null || (!historical && Number(row['not_fully_idle']) !== 0)) return history;
+    try {
+      // The summary can point at -1 for a created chat, or at a later private message.
+      // Read the requested turn from its own native input and stop at the next input.
+      const offset = Number(input);
+      const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: offset }, { timeout: 3500 }), 'steps'));
+      if (stepKind(steps[0]) !== 'USER_INPUT') return history;
+      if (receipt && !promptStarts(asText(recordsOfStep(steps[0], offset)[0]?.content), receipt.marker)) return history;
+      const nextInput = steps.findIndex((step, index) => index > 0 && stepKind(step) === 'USER_INPUT');
+      if (historical && nextInput < 0) return history;
+      const outcome = outcomeOfSteps(steps.slice(1, nextInput < 0 ? undefined : nextInput), true);
+      if (outcome) Object.assign(turn, { status: outcome.status, statusEvidence: 'desktop_trajectory', ...(outcome.error && { error: outcome.error.message }) });
+    } catch { /* The original record remains readable while the desktop reconnects. */ }
     return history;
   }
 
@@ -1042,16 +1065,7 @@ class AntigravityBridge extends EventEmitter {
   } = {}): Promise<Outcome | null> {
     try {
       const steps = list(get(await this.ls('GetCascadeTrajectorySteps', { cascadeId: conversationId, stepOffset: Math.max(0, Number(row['last_user_input_step_index']) || 0) }), 'steps'));
-      // System notices (an MCP's context injections among them) are not how a turn ends, and a
-      // cascade the desktop already calls idle may not have written its ending yet: completed is
-      // said only when the desktop answered (its reply, or the notification it shows), failed on
-      // its error, interrupted on its stop. Anything else is still waiting for its ending.
-      const last = steps.slice(1).filter(step => stepKind(step) !== 'EPHEMERAL_MESSAGE').at(-1);
-      if (!last || (requireSettled && !SETTLED.has(stepStatus(last)))) return null;
-      const error = shownError(last);
-      if (error) return { status: 'failed', error: { message: errorText(error) } };
-      if (['CANCELED', 'INTERRUPTED'].includes(stepStatus(last))) return { status: 'interrupted' };
-      return ['PLANNER_RESPONSE', 'NOTIFY_USER'].includes(stepKind(last)) ? { status: 'completed' } : null;
+      return outcomeOfSteps(steps.slice(1), requireSettled);
     } catch {
       return failure ? { status: 'failed', error: { message: failure } } : received ? { status: 'completed' } : null;
     }

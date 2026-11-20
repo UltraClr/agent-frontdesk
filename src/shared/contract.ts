@@ -281,8 +281,8 @@ export interface CoordinatorAdapter {
   defaultModel?(): Awaitable<string>;
   /** Desktop catalog metadata only. A cwd restricts recovery to one project. */
   catalog(cwd?: string): Awaitable<SessionCandidate[]>;
-  /** Reads a known native coding session, including on recovery by its saved ID. */
-  read(id: string): Awaitable<History>;
+  /** Reads a known native coding session. Adapters can confirm a specific delivery on recovery. */
+  read(id: string, receipt?: { marker: string; turnId?: string | null }): Awaitable<History>;
   /** Native setting the send channel needs repeated for an existing session. */
   modelForSend?(session: UnifiedSession): string | undefined;
 }

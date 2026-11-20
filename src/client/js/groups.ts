@@ -489,13 +489,14 @@ export class GroupPanel {
     const label = item.kind === 'host' ? t('群主') : item.removedMember || room.members.find(member => member.engine === item.engine && member.id === (item.memberId || item.target))?.alias || this.label(item.engine);
     const state = item.outcome ? receiptOutcomes[item.outcome] : item.state === 'done' ? '投递记录已结束'
       : item.state === 'blocked' ? '未投递' : item.creatingMember ? item.state === 'queued' ? '等待新建成员会话' : '正在确认新会话'
-        : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
+        : item.state === 'queued' ? '等待投递' : item.state === 'waiting' ? '等待用户操作'
+          : item.awaitingOutcome ? '正在确认原生轮次结果' : item.nativeTurn ? '等待目标回复' : '正在确认桌面记录';
     const href = item.creatingMember || !item.target ? '' : escape(nativeLink(item.engine, item.target, item.nativeTurn || undefined));
     const target = href ? `<a data-group-link href="${href}">${escape(label)}${icon('arrow-up-right')}</a>` : escape(label);
     const retry = item.state === 'blocked' && !room.paused ? `<button type="button" data-group-delivery-retry="${escape(item.id)}">${t('重试投递')}</button>` : '';
     const revision = showRevision && item.taskRevision !== undefined ? t('第 {n} 版', { n: item.taskRevision }) : '';
     const meta = [revision, item.removedMember ? t('已移出群聊') : ''].filter(Boolean).join(' · ');
-    const tone = taskTone(item.outcome || (item.state === 'sent' && !item.nativeTurn ? 'confirming' : item.state));
+    const tone = taskTone(item.outcome || (item.state === 'sent' && (!item.nativeTurn || item.awaitingOutcome) ? 'confirming' : item.state));
     return `<div class="group-delivery">
       <span class="group-delivery-face" aria-hidden="true">${this.face(item.engine)}</span>
       <div class="group-delivery-copy"><strong>${target}</strong>${meta ? `<small>${meta}</small>` : ''}</div>
@@ -525,6 +526,7 @@ export class GroupPanel {
 
   private dispatchStatus(item: GroupDelivery, member: string): string {
     if (item.state === 'waiting') return t('等待处理 {member} 的会话', { member });
+    if (item.state === 'sent' && item.awaitingOutcome) return t('正在确认原生轮次结果');
     if (item.state === 'sent' && item.nativeTurn) return t('正在等 {member} 回复', { member });
     if (item.state === 'sent') return t('正在确认发给 {member} 的消息', { member });
     if (item.note || item.state === 'blocked') return t('发给 {member} 的任务受阻', { member });

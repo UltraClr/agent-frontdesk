@@ -214,6 +214,7 @@ export class Groups {
     return { id, groupId, engine, target: member?.sessionId || target, question, kind,
       state: memberCreationRefused(work) ? 'blocked' : work.state, nativeTurn, dispatched, note, attention, memberId, outcome,
       creatingMember: !!member?.dedicated && !member.sessionId, removedMember: work.formerMember?.alias,
+      ...(work.awaitingOutcome && { awaitingOutcome: true }),
       ...(taskId && { taskId, taskRevision: taskRevision(work) }) };
   }
 
@@ -247,7 +248,7 @@ export class Groups {
       .map(work => this.delivery(room, work, task.id));
     const state = task.state !== 'open' ? task.state
       : current.some(item => item.state === 'waiting') ? 'waiting'
-        : current.some(item => item.state === 'sent' && item.nativeTurn) ? 'running'
+        : current.some(item => item.state === 'sent' && item.nativeTurn && !item.awaitingOutcome) ? 'running'
           : current.some(item => item.state === 'sent') ? 'confirming'
             : current.some(item => item.state === 'blocked' || item.note) ? 'blocked'
               : 'queued';
@@ -1293,7 +1294,7 @@ export class Groups {
       contextReads: work.contextReads, remaining: 0, root: work.root, resume: false, summaryOnly: true });
   }
 
-  private acceptReceipt(work: Work, turn: UnifiedTurn) {
+  private acceptReceipt(work: Work, turn: UnifiedTurn, desktopMovedOn: boolean) {
     return this.transaction(() => {
       const live = this.activeWork(work.id);
       if (!live) return;
@@ -1304,10 +1305,12 @@ export class Groups {
       const approval = turn.approvals?.[0];
       if (approval || !terminal(turn)) {
         work.state = approval ? 'waiting' : 'sent';
+        work.awaitingOutcome = !approval && desktopMovedOn;
         work.attention = approval && { id: approval.id, title: approval.title, kind: approval.kind };
         this.updateWork(work);
         return;
       }
+      delete work.awaitingOutcome;
       const taskId = work.taskId ?? (hosted(work) ? work.root : undefined);
       const base = { id: work.id + '/reply', author: work.kind === 'host' ? 'host' : workMember(room, work)?.alias || '',
         replyTo: work.question, native: { engine: work.engine, id: work.target, turn: turn.id },
@@ -1518,11 +1521,11 @@ export class Groups {
       try { await this.createHost(JSON.parse(String(row.data)) as GroupRecord); } catch { /* Preserve the attempt if desktop creation is uncertain. */ }
     }
     const active = this.work('sent', 'waiting', 'queued');
-    const wanted = new Set<string>();
+    const wanted = new Map<string, Work>();
     for (const work of active) {
       if (work.state === 'queued' || (work.memberId && work.target === work.memberId)) continue;
       const key = targetKey(work.engine, work.target);
-      wanted.add(key);
+      wanted.set(key, work);
       if (!this.watches.has(key)) {
         const release = this.host.engines.get(work.engine)?.watchSession?.(work.target, () => this.kick());
         if (release) this.watches.set(key, release);
@@ -1549,7 +1552,12 @@ export class Groups {
         }
         const key = targetKey(work.engine, work.target);
         let pending = histories.get(key);
-        if (!pending) { pending = Promise.resolve(engine.coordinator.read(work.target)); histories.set(key, pending); }
+        if (!pending) {
+          const delivery = wanted.get(key);
+          const receipt = delivery && { turnId: delivery.nativeTurn, marker: marker(delivery.id) };
+          pending = Promise.resolve(engine.coordinator.read(work.target, receipt));
+          histories.set(key, pending);
+        }
         const history = await pending;
         if (this.stopped || history.session?.id !== work.target) continue;
         work = this.activeWork(work.id);
@@ -1566,7 +1574,8 @@ export class Groups {
           const { id, nativeTurn } = work;
           const turn = history.turns.find(turn => (!nativeTurn || turn.id === nativeTurn) && promptStarts(turn.userPrompt, marker(id)));
           // Only an explicit, correlated native record can confirm a message.
-          if (turn) this.acceptReceipt(work, turn);
+          if (turn) this.acceptReceipt(work, turn,
+            turn !== history.turns.at(-1) || (history.session.status === 'idle' && !sessionBusy(history)));
           else {
             const run = this.runs.get(work.engine, work.target);
             const approval = run?.origin === work.id ? run.run.approvals[0] : undefined;

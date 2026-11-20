@@ -83,6 +83,7 @@ export interface GroupDelivery {
   kind: 'member' | 'host' | 'report';
   state: 'queued' | 'sent' | 'waiting' | 'blocked' | 'done';
   nativeTurn: string | null;
+  awaitingOutcome?: boolean;
   dispatched: number | null;
   note: string;
   taskId?: string;
