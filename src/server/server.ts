@@ -361,6 +361,11 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
   app.post('/api/groups/:engine/create', async (req, res) => res.status(202).json(await groups.create(engineOf(req), req.body)));
   app.get('/api/groups/:group', (req, res) => res.json(groups.view(req.params.group, Number(req.query.before) || undefined)));
   app.get('/api/groups/:group/task', (req, res) => res.json(groups.progress(req.params.group)));
+  app.get('/api/groups/:group/context/:message', (req, res) => res.json(groups.messageContext(req.params.group, req.params.message)));
+  app.get('/api/groups/:group/results', (req, res) => res.json(groups.results(req.params.group, String(req.query.task || ''), Number(req.query.revision))));
+  app.put('/api/groups/:group/results', (req, res) => res.json(groups.adoptResult(req.params.group, req.body)));
+  app.post('/api/groups/:group/templates/preview', (req, res) => res.json(groups.previewTemplate(req.params.group, req.body)));
+  app.post('/api/groups/:group/templates', (req, res) => res.status(202).json(groups.startTemplate(req.params.group, req.body)));
   app.post('/api/groups/:group/task/cancel', (req, res) => res.json(groups.cancel(req.params.group, req.body)));
   app.get('/api/groups/:group/decisions', (req, res) => res.json(groups.decisions(req.params.group, Number(req.query.before) || undefined)));
   app.post('/api/groups/:group/prepare', async (req, res) => res.json(await groups.prepare(req.params.group)));

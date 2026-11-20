@@ -1,13 +1,15 @@
 import type { GroupDelivery, GroupDispatchStep, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupSummary, GroupView } from '../../shared/groups.js';
-import { messageOf } from '../../shared/guards.js';
-import { request } from './api.js';
+import type { GroupMessagePage, GroupResults } from '../../shared/group-workflow.js';
+import { get, messageOf, str } from '../../shared/guards.js';
+import { answer, request } from './api.js';
 import { say, t } from './i18n.js';
 import { character, escape, hydrateIcons, icon, markdown } from './renderers.js';
+import { GroupWorkflowDialog } from './group-workflow.js';
 
 type Page = { items: GroupSummary[]; nextOffset: number | null };
 type Agent = { id: string; label: string };
 type TaskAction = 'start' | 'supplement' | 'replace';
-type Draft = { text: string; member: string; replyTo: string; key?: string; taskAction?: TaskAction; taskId?: string; taskRevision?: number; allowParallel?: boolean };
+type Draft = { text: string; member: string; replyTo: string; quoteLabel?: string; key?: string; taskAction?: TaskAction; taskId?: string; taskRevision?: number; allowParallel?: boolean };
 const activeTaskStates = new Set(['queued', 'confirming', 'running', 'waiting', 'blocked', 'paused']);
 const taskLabels = {
   queued: '等待投递', confirming: '正在确认桌面记录', running: '正在推进', waiting: '等待用户操作', blocked: '群任务受阻',
@@ -183,6 +185,7 @@ export class GroupPanel {
   private directoryMarkup = '';
   private older: GroupMessage[] = [];
   private before: number | null | undefined;
+  private archive?: GroupMessagePage;
   private draft: Draft = { text: '', member: '', replyTo: '' };
   private readonly list: HTMLElement;
   private readonly title: HTMLElement;
@@ -198,6 +201,7 @@ export class GroupPanel {
   private readonly taskAction: HTMLSelectElement;
   private readonly dispatchMode: HTMLSelectElement;
   private readonly dialog: HTMLDialogElement;
+  private readonly workflow: GroupWorkflowDialog;
 
   constructor(readonly panel: HTMLElement, private sidebar: HTMLElement, private currentEngine: () => string,
     private agents: () => Agent[], private show: (id: string) => void, private back: () => void, private openSidebar: () => void, private followLink: (hash: string) => void) {
@@ -229,6 +233,7 @@ export class GroupPanel {
           <label><span>${t('发送给')}</span><span class="group-select">${icon('at-sign')}<select aria-label="${t('收件人')}"></select>${icon('chevron-down')}</span></label>
           <label data-group-task-action hidden><span>${t('任务操作')}</span><span class="group-select"><select aria-label="${t('任务操作')}"></select>${icon('chevron-down')}</span></label>
           <label data-group-dispatch-mode><span>${t('派发方式')}</span><span class="group-select"><select aria-label="${t('派发方式')}"><option value="">${t('按顺序')}</option><option value="parallel">${t('允许并行')}</option></select>${icon('chevron-down')}</span></label>
+          <button type="button" class="group-template-trigger" data-group-template>${icon('list-plus')}${t('使用模板')}</button>
           <button class="primary-button group-send" type="submit">${icon('arrow-up')}<span>${t('发送')}</span></button>
         </div>
       </form>
@@ -245,6 +250,7 @@ export class GroupPanel {
     this.taskAction = panel.querySelector('[data-group-task-action] select')!;
     this.dispatchMode = panel.querySelector('[data-group-dispatch-mode] select')!;
     this.dialog = panel.querySelector('dialog')!;
+    this.workflow = new GroupWorkflowDialog(engine => this.label(engine), this.followLink);
     document.body.append(this.dialog);
     this.list = document.createElement('div');
     this.list.className = 'group-list';
@@ -342,6 +348,7 @@ export class GroupPanel {
 
   close() {
     if (!this.active) return;
+    this.workflow.close();
     this.save();
     if (this.room) {
       const edge = this.timeline.getBoundingClientRect().top;
@@ -365,6 +372,7 @@ export class GroupPanel {
       this.target = message || getLocal('frontdesk:group:anchor:' + id) || '';
       this.older = [];
       this.before = undefined;
+      this.archive = undefined;
       this.timeline.replaceChildren();
       this.input.value = '';
       this.receiver.value = '';
@@ -394,16 +402,15 @@ export class GroupPanel {
     try {
       const room = await request<GroupView>(url(id));
       if (!current()) return;
-      if (this.target && !room.messages.some(message => message.id === this.target)) {
-        let before = room.before;
-        const accumulated: GroupMessage[] = [];
-        while (before && !accumulated.some(message => message.id === this.target)) {
-          const page = await request<GroupView>(url(id) + '?before=' + before);
-          if (!current()) return;
-          accumulated.unshift(...page.messages); before = page.before;
-        }
-        this.older = accumulated;
-        this.before = before;
+      const target = this.target;
+      if (target && ![...this.older, ...(this.archive?.messages || room.messages)].some(message => message.id === target)) {
+        const context = room.messages.some(message => message.id === target) ? undefined
+          : await answer<GroupMessagePage>(url(id) + '/context/' + enc(target));
+        if (!current()) return;
+        if (context && !context.ok && context.status !== 404) throw new Error(say(str(get(context.data, 'error')) || t('群发言不存在')));
+        this.older = [];
+        this.before = undefined;
+        this.archive = context?.ok ? context.data : undefined;
       }
       if (!this.room || this.target || JSON.stringify(this.room) !== JSON.stringify(room)) this.render(room);
     } catch (err) { if (current()) this.status.textContent = messageOf(err); }
@@ -456,13 +463,16 @@ export class GroupPanel {
       if (!first && this.receiver.selectedIndex === -1) this.draft.key = undefined;
     }
     if (first) { this.receiver.value = this.draft.member; this.input.value = this.draft.text; }
-    const before = this.before === undefined ? room.before : this.before;
-    const messages = [...this.older, ...room.messages];
+    this.form.querySelector<HTMLButtonElement>('[data-group-template]')!.disabled = room.members.length < 2;
+    const before = this.before === undefined ? (this.archive ? this.archive.before : room.before) : this.before;
+    const messages = [...this.older, ...(this.archive?.messages || room.messages)];
     const distinct = new Map(messages.map(message => [message.id, message]));
     const rows = [...distinct.values()].map(message => this.renderMessage(message, distinct)).join('');
     const waiting = room.deliveries.filter(item => !room.task || item.taskId !== room.task.id).map(item => this.renderDelivery(room, item)).join('');
     const empty = !rows && !waiting && room.state === 'ready' ? `<div class="group-empty">${icon('messages-square')}<h2>${t('开始讨论')}</h2><p>${t('可以请群主组织讨论，也可以直接给某个成员发消息。')}</p></div>` : '';
-    this.timeline.innerHTML = (before ? `<button class="group-older" data-group-older type="button">${icon('history')}${t('查看更早发言')}</button>` : '') + rows + waiting + empty;
+    const latest = this.archive ? `<button class="group-older" data-group-latest type="button">${icon('arrow-down')}${t('返回最新发言')}</button>` : '';
+    this.timeline.innerHTML = (before ? `<button class="group-older" data-group-older type="button">${icon('history')}${t('查看更早发言')}</button>` : '')
+      + rows + (this.archive ? latest : waiting) + empty;
     this.renderTask(room);
     this.updateTaskAction();
     this.updateQuote();
@@ -471,7 +481,7 @@ export class GroupPanel {
     if (anchor) anchor.scrollIntoView({ block: 'center' });
     else if (follow) this.timeline.scrollTop = this.timeline.scrollHeight;
     this.target = '';
-    setLocal('frontdesk:group:read:' + room.id, String(room.latest));
+    if (!this.archive) setLocal('frontdesk:group:read:' + room.id, String(room.latest));
     this.drawDirectory();
   }
 
@@ -564,6 +574,7 @@ export class GroupPanel {
       ${task.request ? `<p class="group-task-full-request">${escape(task.request)}</p>` : ''}
       ${sequence ? `<ol class="group-plan" aria-label="${t('派发顺序')}">${sequence}</ol>` : ''}
       ${task.deliveries.filter(item => !planIds.has(item.id)).map(item => this.renderDelivery(room, item, true)).join('')}
+      <button type="button" data-group-results="${escape(task.id)}" data-revision="${task.revision}">${icon('file-check-2')}${t('查看任务结果')}</button>
       ${activeTaskStates.has(task.state) ? `<button type="button" data-group-task-cancel>${icon('circle-stop')}${t('停止后续派发')}</button>` : ''}
       </div></details>` : '';
     if (this.taskMarkup === markup) return;
@@ -614,7 +625,8 @@ export class GroupPanel {
 
   private renderMessage(message: GroupMessage, messages: Map<string, GroupMessage>) {
     const reply = message.replyTo && messages.get(message.replyTo);
-    const author = message.kind === 'user' ? t('你') + ' → ' + (message.author || t('群主'))
+    const author = message.template ? t('你') + ' · ' + t(message.template === 'proposals' ? '双案提案' : '证据复核')
+      : message.kind === 'user' ? t('你') + ' → ' + (message.author || t('群主'))
       : message.kind === 'host' ? t('群主') : message.author;
     const face = message.native?.engine && message.kind !== 'notice' ? this.face(message.native.engine)
       : message.kind === 'host' && this.room ? this.face(this.room.engine) : '';
@@ -626,6 +638,7 @@ export class GroupPanel {
       <footer>${sources}${message.replaces ? `<a data-group-link href="#group/${enc(this.id)}/${enc(message.replaces)}">${t('查看被取代的结论')}</a>` : ''}
         ${message.native ? `<a data-group-link href="${escape(nativeLink(message.native.engine, message.native.id, message.native.turn))}">${t('查看原会话')}</a>` : ''}
         <button type="button" data-group-quote="${escape(message.id)}">${t('回复这条')}</button>
+        ${message.kind === 'user' && !message.author && message.taskId && message.taskRevision ? `<button type="button" data-group-results="${escape(message.taskId)}" data-revision="${message.taskRevision}">${t('查看任务结果')}</button>` : ''}
         ${message.decision ? `<button type="button" data-group-report="${escape(message.id)}">${t('汇报给总控')}</button>` : ''}
       </footer>
     </article>`;
@@ -642,8 +655,8 @@ export class GroupPanel {
     const quote = this.form.querySelector<HTMLElement>('.group-quote')!;
     quote.hidden = !this.draft.replyTo;
     if (!quote.hidden) {
-      const message = [...this.older, ...(this.room?.messages || [])].find(item => item.id === this.draft.replyTo);
-      quote.innerHTML = `${icon('message-square-quote')}<span>${escape(message?.text.slice(0, 130) || t('引用发言'))}</span><button type="button" data-group-unquote title="${t('移除引用')}" aria-label="${t('移除引用')}">${icon('x')}</button>`;
+      const message = [...this.older, ...(this.archive?.messages || []), ...(this.room?.messages || [])].find(item => item.id === this.draft.replyTo);
+      quote.innerHTML = `${icon('message-square-quote')}<span>${escape(message?.text.slice(0, 130) || this.draft.quoteLabel || t('引用发言'))}</span><button type="button" data-group-unquote title="${t('移除引用')}" aria-label="${t('移除引用')}">${icon('x')}</button>`;
       hydrateIcons(quote);
     }
   }
@@ -701,6 +714,28 @@ export class GroupPanel {
     if (!this.room) return;
     const room = this.room, base = url(room.id);
     try {
+      if (button.hasAttribute('data-group-template')) {
+        const messages = [...this.older, ...(this.archive?.messages || room.messages)];
+        this.workflow.template(room, messages, this.draft.replyTo, updated => {
+          if (this.id !== room.id) return;
+          this.archive = undefined; this.older = []; this.before = undefined;
+          this.target = updated.task?.id || '';
+          this.roomGeneration++;
+          this.render(updated);
+        });
+        return;
+      }
+      if (button.dataset.groupResults) {
+        this.workflow.results(room, button.dataset.groupResults, Number(button.dataset.revision), entry => this.reviseResult(entry));
+        return;
+      }
+      if (button.hasAttribute('data-group-latest')) {
+        this.archive = undefined; this.older = []; this.before = undefined;
+        this.target = room.messages.at(-1)?.id || '';
+        this.show(room.id);
+        this.render(room);
+        return;
+      }
       if (button.dataset['groupMemberConfig']) {
         const member = room.members.find(item => item.id === button.dataset['groupMemberConfig']);
         if (member?.canEditSetup) this.editMember(room, member);
@@ -713,17 +748,18 @@ export class GroupPanel {
       }
       if (button.dataset['groupQuote']) {
         this.draft.replyTo = button.dataset['groupQuote']; this.draft.key = undefined;
+        this.draft.quoteLabel = undefined;
         this.save(); this.updateQuote(); this.input.focus(); return;
       }
       if (button.hasAttribute('data-group-unquote')) {
-        this.draft.replyTo = ''; this.draft.key = undefined; this.save(); this.updateQuote(); return;
+        this.draft.replyTo = ''; this.draft.quoteLabel = undefined; this.draft.key = undefined; this.save(); this.updateQuote(); return;
       }
       if (button.hasAttribute('data-group-older')) {
-        const before = this.before === undefined ? room.before : this.before;
+        const before = this.before === undefined ? (this.archive ? this.archive.before : room.before) : this.before;
         if (!before) return;
         const page = await request<GroupView>(base + '?before=' + before);
         if (this.id !== room.id) return;
-        this.target = ([...this.older, ...room.messages][0]?.id || '');
+        this.target = ([...this.older, ...(this.archive?.messages || room.messages)][0]?.id || '');
         this.older.unshift(...page.messages); this.before = page.before; this.render(room); return;
       }
       if (button.hasAttribute('data-group-manage')) {
@@ -760,6 +796,22 @@ export class GroupPanel {
         await this.refresh();
       }
     } catch (err) { if (this.id === room.id) this.status.textContent = messageOf(err); }
+  }
+
+  private reviseResult(entry: GroupResults['entries'][number]) {
+    const message = entry.message;
+    if (!this.room || this.form.hidden || !message?.native) return;
+    const member = entry.delivery?.kind === 'member' ? this.room.members.find(candidate =>
+      !entry.delivery?.removedMember && candidate.engine === message.native?.engine && nativeId(candidate) === message.native.id) : undefined;
+    if (entry.delivery?.kind === 'member' && !member) { this.status.textContent = t('原成员已移出群聊'); return; }
+    this.receiver.value = member ? memberKey(member) : '';
+    this.draft.replyTo = message.id;
+    this.draft.quoteLabel = message.text.slice(0, 130);
+    this.input.value = [this.input.value.trim(), t('请根据以下反馈修改引用的结果。')].filter(Boolean).join('\n\n') + '\n\n';
+    this.changeRecipient();
+    this.updateQuote();
+    this.input.focus();
+    this.input.setSelectionRange(this.input.value.length, this.input.value.length);
   }
 
   private changeHostDialog(room: GroupView) {

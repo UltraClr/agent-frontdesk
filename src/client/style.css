@@ -2408,6 +2408,25 @@ a.coordinator-task:focus-visible { outline-offset: -2px; }
 .group-dialog-head h2 { font-size: 19px; margin: 0; }
 .group-dialog-head p { font-size: 12px; color: var(--muted); margin: 3px 0 0; }
 .group-create-form { display: grid; gap: 15px; padding: 16px 22px; }
+.group-template-trigger { display: inline-flex; align-items: center; gap: 5px; padding: 5px 7px; color: var(--muted); border-radius: 6px; font-size: 12px; }
+.group-template-trigger:hover { color: var(--text); background: var(--surface); }
+.group-template-trigger .lucide { width: 14px; height: 14px; }
+.group-workflow-dialog { width: min(720px, calc(100vw - 24px)); }
+.group-workflow-form [data-template-edit]:not([hidden]), .group-workflow-form [data-template-preview]:not([hidden]), .group-result-cards { display: grid; gap: 12px; }
+.group-workflow-form label:not(.group-workflow-checkbox) { display: grid; gap: 5px; font-size: 13px; min-width: 0; }
+.group-workflow-two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 10px; }
+.group-workflow-two > div { display: grid; gap: 8px; min-width: 0; }
+.group-workflow-form input:not([type=checkbox]), .group-workflow-form select, .group-workflow-dialog textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
+.group-workflow-dialog textarea { min-height: 72px; resize: vertical; }
+.group-workflow-checkbox { display: flex; align-items: baseline; gap: 6px; font-size: 12px; }
+.group-workflow-checkbox input { accent-color: var(--accent); }
+.group-workflow-step, .group-result-card { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; min-width: 0; overflow-wrap: anywhere; }
+.group-workflow-step pre, .group-workflow-form blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 7px 0 0; font-size: 12px; }
+.group-workflow-step p, .group-workflow-form details, [data-result-status] { margin: 0; color: var(--muted); font-size: 12px; }
+.group-result-card header, .group-result-card footer { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+.group-result-card > .markdown, .group-result-card footer { margin-block-start: 8px; }
+.group-result-card footer a, .group-result-card footer button { font-size: 12px; color: var(--accent); }
+.group-result-card footer button { padding: 0; }
 .group-setup-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 12px; }
 .group-setup-fields label { display: grid; gap: 5px; font-size: 13px; font-weight: 600; }
 .group-default-project { grid-column: 1/-1; }

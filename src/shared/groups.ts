@@ -1,4 +1,5 @@
 import type { Approval, Model, Project } from './contract.js';
+import type { GroupTemplate } from './group-workflow.js';
 
 export interface GroupMemberSetup {
   /** Omitted inherits the group workspace. Null uses the engine's discussion location. */
@@ -70,6 +71,7 @@ export interface GroupMessage {
   decision?: boolean;
   taskId?: string;
   taskRevision?: number;
+  template?: GroupTemplate;
 }
 
 export interface GroupDelivery {

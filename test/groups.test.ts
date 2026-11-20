@@ -138,6 +138,83 @@ test('an unapproved parallel request falls back to sequential collection', async
   assert.equal(fixture.sent[2]?.target, 'dsh:B');
 });
 
+test('evidence template previews participants and passes the actual first reply only after completion', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'evidence-template');
+  await groups.poll();
+  const participants = groups.view(id).members.map(item => item.enrollmentId!);
+  const input = { template: 'evidence', language: 'en', members: participants.slice(0, 2), roles: ['Gather case studies', 'Check each footnote'],
+    material: 'Review the draft', criteria: 'Cite the primary source', sources: [], summarize: true };
+  const preview = groups.previewTemplate(id, input);
+  assert.equal(fixture.sent.length, 0);
+  assert.deepEqual(preview.steps.map(step => [step.member, step.followsPrevious]), [['A', false], ['B', true]]);
+  const confirm = { ...input, version: preview.version, key: 'confirm-evidence' };
+  const task = must(groups.startTemplate(id, confirm).task);
+  assert.equal(groups.view(id).messages.at(-1)?.template, 'evidence');
+  groups.startTemplate(id, confirm);
+  await groups.poll();
+  assert.deepEqual(fixture.sent.map(item => item.target), ['dsh:A']);
+  assert(must(fixture.sent[0]).prompt.includes(must(preview.steps[0]).prompt));
+  assert.equal(groups.results(id, task.id, task.revision).entries[1]?.pending, 'planned');
+  groups = await fixture.reopen(true);
+  fixture.finish(0, 'PRIMARY: controlled experiment, Appendix 3');
+  await groups.poll(); await groups.poll();
+  assert.deepEqual(fixture.sent.map(item => item.target), ['dsh:A', 'dsh:B']);
+  const reviewerPrompt = must(fixture.sent[1]).prompt;
+  assert(reviewerPrompt.includes(must(preview.steps[1]).prompt));
+  assert.match(reviewerPrompt, /PRIMARY: controlled experiment, Appendix 3/);
+  fixture.finish(1, 'The appendix verifies just one of the claims.');
+  await groups.poll(); await groups.poll();
+  assert.equal(fixture.sent.length, 3);
+  const summaryPrompt = must(fixture.sent[2]).prompt;
+  assert.match(summaryPrompt, /Review the draft/);
+  assert.match(summaryPrompt, /Appendix 3/);
+  assert.match(summaryPrompt, /verifies just one/);
+  fixture.finish(2, groupAction({ action: 'summary', text: 'One claim was verified.' }));
+  await groups.poll();
+  const first = must(groups.results(id, task.id, task.revision).entries[0]);
+  const message = must(first.message);
+  assert.equal(first.adopted, false);
+  groups.adoptResult(id, { taskId: task.id, revision: task.revision, messageId: message.id, adopted: true });
+  groups = await fixture.reopen();
+  assert.equal(groups.results(id, task.id, task.revision).entries[0]?.adopted, true);
+  assert.equal(groups.messageContext(id, message.id).messages.some(item => item.id === message.id), true);
+  const other = await fixture.create(fixture.codex, 'other-results');
+  assert.throws(() => groups.messageContext(other.id, message.id), /群发言不存在/);
+  const stalePreview = groups.previewTemplate(id, input);
+  await groups.changeMembers(id, { remove: [{ engine: 'dsh', id: 'B' }], add: [{ engine: 'dsh', id: 'B', alias: 'B' }] });
+  assert.throws(() => groups.startTemplate(id, { ...input, key: 'stale', version: stalePreview.version }), /请选择两位不同/);
+  for (let index = 0; index < 70; index++) groups.send(id, { key: 'later-' + index, member: 'A', text: 'Later discussion ' + index });
+  assert.equal(groups.view(id).messages.some(item => item.id === message.id), false);
+  const context = groups.messageContext(id, message.id);
+  assert(context.messages.length <= 30);
+  assert(context.messages.some(item => item.id === message.id));
+  assert(!context.messages.some(item => item.text === 'Later discussion 69'));
+});
+
+test('two proposals show the result that arrives first and keep failures unaccepted', async t => {
+  const fixture = setup(t), groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'proposal-template');
+  await groups.poll();
+  const input = { template: 'proposals', members: groups.view(id).members.slice(0, 2).map(item => item.enrollmentId),
+    material: 'Same brief', criteria: 'Provide an independent hook', roles: ['Comedy', 'Fantasy'] };
+  const preview = groups.previewTemplate(id, input);
+  const task = must(groups.startTemplate(id, { ...input, key: 'publish-proposals', version: preview.version }).task);
+  await groups.poll();
+  assert.deepEqual(fixture.sent.map(item => item.target), ['dsh:A', 'dsh:B']);
+  fixture.finish(1, 'Fantasy result');
+  await groups.poll();
+  assert.equal(groups.results(id, task.id, task.revision).entries[0]?.message?.text, 'Fantasy result');
+  const branch = must(fixture.sent[0]);
+  must(fixture.histories.get(branch.target)).turns.push(new UnifiedTurn({ id: 'failed', userPrompt: branch.prompt, status: 'failed', statusEvidence: 'native' }));
+  await groups.poll();
+  const entries = groups.results(id, task.id, task.revision).entries;
+  assert.equal(entries[1]?.delivery?.outcome, 'failed');
+  assert.throws(() => groups.adoptResult(id, { taskId: task.id, revision: task.revision, messageId: entries[1]?.message?.id, adopted: true }), /只能采纳/);
+  assert.equal(groups.progress(id)?.state, 'partial');
+});
+
 test('mixed agents can join as fresh or existing members and only a recipient gets a native chat', async t => {
   const fixture = setup(t);
   let groups = await fixture.reopen();

@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { CreateInput, CreateResult, Engine, FrontdeskSessionRole, TimeValue, UnifiedSession, UnifiedTurn } from '../../shared/contract.js';
 import type { GroupDelivery, GroupDispatchStep, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupState, GroupSummary, GroupTask, GroupView } from '../../shared/groups.js';
 import type { InboxSignal } from '../../shared/inbox.js';
+import { templatePrompt, type GroupMessagePage, type GroupResults, type GroupTemplate, type GroupTemplatePreview } from '../../shared/group-workflow.js';
 import { errorField, failure, get, list, messageOf, str } from '../../shared/guards.js';
 import { promptStarts } from '../../shared/turn-match.js';
 import { sessionBusy, type RunService } from '../core/run-service.js';
@@ -15,7 +16,7 @@ type CreateNative = (engine: Engine, input: CreateInput, origin?: string) => Pro
 type ReportBinding = { engine: string; id: string; origin?: string };
 type RecordReport = (binding: ReportBinding, id: string, text: string) => void;
 type RosterEntry = { alias: string; enrollment: string };
-type MemberStep = { member: string; text: string; sources?: string[]; enrollment?: string | null };
+type MemberStep = { member: string; text: string; sources?: string[]; enrollment?: string | null; followsPrevious?: boolean };
 type TaskState = 'open' | 'waiting' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed';
 type StoredTask = { id: string; revision: number; state: TaskState; allowParallel?: boolean };
 
@@ -58,6 +59,7 @@ interface Work extends GroupDelivery {
   batch?: MemberStep[];
   parallelBatch?: string;
   summaryOnly?: boolean;
+  template?: GroupTemplate;
   roster?: RosterEntry[];
   sources?: string[];
   included?: string[];
@@ -95,8 +97,8 @@ const maxSteps = 3;
 const maxContextReads = 3;
 const contextPage = 12;
 const resumeAfterMembers = 'Continue the current request using the new results from your member tasks.';
-const hosted = (work: Work) => work.kind === 'host' || work.automated === true;
-const taskRevision = (work: Work) => work.taskRevision ?? work.version;
+const hosted = (work: Pick<Work, 'kind' | 'automated'>) => work.kind === 'host' || work.automated === true;
+const taskRevision = (work: Pick<Work, 'taskRevision' | 'version'>) => work.taskRevision ?? work.version;
 const activeTask = (task: StoredTask) => ['open', 'waiting', 'paused'].includes(task.state);
 
 function memberCreationRefused(work: Work) {
@@ -134,6 +136,7 @@ export class Groups {
       CREATE INDEX IF NOT EXISTS group_work_room ON group_work(room, state);
       CREATE INDEX IF NOT EXISTS group_work_task ON group_work(room, json_extract(data,'$.root'));
       CREATE TABLE IF NOT EXISTS group_host_inputs (room TEXT NOT NULL, target TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY(room, target, message));
+      CREATE TABLE IF NOT EXISTS group_adoptions (room TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY(room,message));
     `);
     if (process.platform !== 'win32') fs.chmodSync(this.file, 0o600);
     return this.db = db;
@@ -253,6 +256,58 @@ export class Groups {
   }
 
   progress(id: string) { return this.taskSnapshot(this.record(id)); }
+
+  messageContext(id: string, messageId: string): GroupMessagePage {
+    const target = this.findMessage(id, messageId);
+    if (!target) throw failure('群发言不存在', { status: 404 });
+    const older = this.messages(id, target.seq, 16);
+    const newer = this.store().prepare('SELECT seq,data FROM group_messages WHERE room=? AND seq>? ORDER BY seq LIMIT 14')
+      .all(id, target.seq).map(row => ({ ...JSON.parse(String(row.data)), seq: Number(row.seq) }) as GroupMessage);
+    const hasOlder = older.length === 16;
+    if (hasOlder) older.shift();
+    const before = hasOlder ? older[0]!.seq : null;
+    return { messages: [...older, target, ...newer], before };
+  }
+
+  results(id: string, taskId: string, revision: number): GroupResults {
+    const room = this.record(id);
+    const task = this.findMessage(id, taskId);
+    const works = this.taskWork(id, taskId).filter(work => hosted(work) && taskRevision(work) === revision);
+    if (!task || task.kind !== 'user' || !works.length) throw failure('群任务结果不存在', { status: 404 });
+    const picked = this.store().prepare('SELECT 1 FROM group_adoptions WHERE room=? AND message=?');
+    const entries = works.flatMap<GroupResults['entries'][number]>(work => {
+      const message = this.findMessage(id, work.id + '/reply');
+      if (work.kind === 'host' && !message?.decision && work.state === 'done' && !work.summaryOnly) return [];
+      return [{
+        id: work.id, engine: work.engine, label: work.kind === 'host' ? '' : workMember(room, work)?.alias || work.engine,
+        message, delivery: this.delivery(room, work, taskId),
+        adopted: !!(message && picked.get(id, message.id)),
+      }];
+    });
+    // Only the latest issued serial step holds the remaining suffix.
+    const active = this.roomTask(room);
+    const taskState = active?.id === taskId && active.revision === revision ? active.state : 'cancelled';
+    const plan = this.dispatchPlan(room, { id: taskId, revision, state: taskState }, works);
+    entries.push(...plan.flatMap((step, index) => 'deliveryId' in step ? [] : [{
+      id: 'planned/' + index, label: step.member, engine: step.engine, pending: step.state, adopted: false,
+    }]));
+    const sequence = (entry: GroupResults['entries'][number]) => entry.message?.seq ?? Number.MAX_SAFE_INTEGER;
+    return { taskId, revision, entries: entries.sort((a, b) => sequence(a) - sequence(b)) };
+  }
+
+  adoptResult(id: string, args: unknown) {
+    const taskId = bounded(get(args, 'taskId'), 400), revision = Number(get(args, 'revision'));
+    const messageId = bounded(get(args, 'messageId'), 400);
+    return this.transaction(() => {
+      const result = this.results(id, taskId, revision);
+      const entry = result.entries.find(item => item.message?.id === messageId && item.delivery?.outcome === 'completed' &&
+        (item.message.kind === 'member' || item.message.decision));
+      if (!entry) throw failure('只能采纳已有的群任务结果', { status: 409 });
+      if (get(args, 'adopted') === true) this.store().prepare('INSERT OR IGNORE INTO group_adoptions VALUES (?,?)').run(id, messageId);
+      else this.store().prepare('DELETE FROM group_adoptions WHERE room=? AND message=?').run(id, messageId);
+      return this.results(id, taskId, revision);
+    });
+  }
 
   inbox(): InboxSignal[] {
     const rows = this.store().prepare(`SELECT w.data, r.data AS room FROM group_work w JOIN rooms r ON r.id=w.room
@@ -779,7 +834,7 @@ export class Groups {
   }
 
   private plan(room: GroupRecord, data: Pick<Work, 'engine' | 'target' | 'question' | 'kind' | 'prompt' | 'root' | 'remaining' | 'resume'> &
-    Partial<Pick<Work, 'binding' | 'batch' | 'parallelBatch' | 'summaryOnly' | 'automated' | 'channelReport' | 'memberId' | 'enrollment' | 'sources' | 'contextReads' | 'moreMemberReplies' | 'taskId' | 'taskRevision' | 'supplement'>>) {
+    Partial<Pick<Work, 'binding' | 'batch' | 'parallelBatch' | 'summaryOnly' | 'template' | 'automated' | 'channelReport' | 'memberId' | 'enrollment' | 'sources' | 'contextReads' | 'moreMemberReplies' | 'taskId' | 'taskRevision' | 'supplement'>>) {
     const task = room.task?.id === data.root && (data.kind === 'host' || data.automated) ? room.task : undefined;
     const work: Work = { ...(task && { taskId: task.id, taskRevision: task.revision }), ...data,
       id: randomUUID(), groupId: room.id, state: 'queued', nativeTurn: null, dispatched: null, note: '', version: room.version };
@@ -886,6 +941,64 @@ export class Groups {
     return this.view(id);
   }
 
+  private templatePlan(room: GroupRecord, args: unknown) {
+    const template = get(args, 'template');
+    const members = list(get(args, 'members')), roles = list(get(args, 'roles'));
+    const material = bounded(get(args, 'material'), 6000), criteria = bounded(get(args, 'criteria'), 2000);
+    const roster = members.map(id => room.members.find(member => enrollmentOf(member) === id));
+    if ((template !== 'proposals' && template !== 'evidence') || !material || !criteria) {
+      throw failure('请填写任务材料和验收条件', { status: 400 });
+    }
+    if (!room.sessionId || room.paused || room.state !== 'ready') throw failure('群聊尚未就绪或已暂停', { status: 409 });
+    if (roster.length !== 2 || !roster[0] || !roster[1] || roster[0] === roster[1]) throw failure('请选择两位不同的群成员', { status: 409 });
+    const sessions = roster.map(member => memberTarget(member!));
+    if (targetKey(sessions[0]!.engine, sessions[0]!.target) === targetKey(sessions[1]!.engine, sessions[1]!.target)) {
+      throw failure('请选择两位不同的群成员', { status: 409 });
+    }
+    const sources = [...new Set(list(get(args, 'sources')).map(id => bounded(id, 400)))];
+    if (sources.length > 3 || sources.some(id => !this.findMessage(room.id, id))) throw failure('群消息引用无效', { status: 400 });
+    const en = get(args, 'language') === 'en';
+    const preview: GroupTemplatePreview = {
+      version: room.version,
+      steps: roster.map((member, index) => ({
+        enrollment: enrollmentOf(member!), member: member!.alias, engine: member!.engine, followsPrevious: template === 'evidence' && index === 1,
+        prompt: templatePrompt(template, index, bounded(roles[index], 600), material, criteria, en),
+      })),
+      sources: this.references(room, sources, 2500),
+    };
+    return { template, preview, sources, material, criteria, summarize: get(args, 'summarize') === true, en } as const;
+  }
+
+  previewTemplate(id: string, args: unknown) { return this.templatePlan(this.record(id), args).preview; }
+
+  startTemplate(id: string, args: unknown) {
+    const key = bounded(get(args, 'key'), 160);
+    if (!key) throw failure('请先预览任务', { status: 400 });
+    this.transaction(() => {
+      const room = this.record(id), messageId = id + '/' + key;
+      if (this.findMessage(id, messageId)) return;
+      if (get(args, 'version') !== room.version) throw failure('群任务已变更，请刷新任务进度', { status: 409 });
+      const previous = this.roomTask(room);
+      if (previous && activeTask(previous)) throw failure('请先完成或停止当前群任务', { status: 409 });
+      const { template, preview, sources, material, criteria, summarize, en } = this.templatePlan(room, args);
+      room.version++;
+      room.task = { id: messageId, revision: 1, state: 'open', allowParallel: template === 'proposals' };
+      const name = template === 'proposals' ? en ? 'Two proposals' : '双案提案' : en ? 'Evidence review' : '证据复核';
+      this.append(room, { id: messageId, kind: 'user', author: '', text: name + '\n\n' + material + '\n\n' + criteria,
+        sources, taskId: messageId, taskRevision: 1, template });
+      const work = { id: messageId, root: messageId, version: room.version, kind: 'member' as const,
+        remaining: maxSteps, automated: true, template };
+      const steps = preview.steps.map(step => ({ member: step.member, enrollment: step.enrollment, text: step.prompt,
+        followsPrevious: step.followsPrevious, sources }));
+      if (template === 'proposals') {
+        if (!this.startParallel(room, work, steps, messageId, summarize)) throw failure('请选择两位不同的群成员', { status: 409 });
+      } else this.nextMember(room, work, steps, messageId, summarize);
+      this.setRoom(room);
+    });
+    this.kick();
+    return this.view(id);
+  }
+
   rename(id: string, args: unknown) {
     const name = bounded(get(args, 'name'), 120);
     if (!name) throw failure('请填写群名', { status: 400 });
@@ -966,7 +1079,7 @@ export class Groups {
     if (blocked || note !== live.note) { live.note = note; this.updateWork(live); }
   }
 
-  private currentTask(room: GroupRecord, work: Work) {
+  private currentTask(room: GroupRecord, work: Pick<Work, 'kind' | 'automated' | 'version' | 'root' | 'taskRevision'>) {
     const task = room.task;
     return task && hosted(work) && room.version === work.version && task.id === work.root &&
       task.revision === taskRevision(work) ? task : undefined;
@@ -983,13 +1096,13 @@ export class Groups {
     if (task?.state !== 'open') return;
     const current = this.taskWork(room.id, task.id).filter(item => hosted(item) && item.version === work.version);
     if (current.some(item => item.state !== 'done')) return;
-    const parallel = current.filter(item => item.parallelBatch);
-    const failedBranch = parallel.some(item => item.outcome !== 'completed');
-    task.state = failedBranch ? parallel.some(item => item.outcome === 'completed') ? 'partial' : 'failed'
+    const branches = current.filter(item => item.parallelBatch || (item.template && item.kind === 'member'));
+    const failedBranch = branches.some(item => item.outcome !== 'completed');
+    task.state = failedBranch ? branches.some(item => item.outcome === 'completed') ? 'partial' : 'failed'
       : outcome === 'completed' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
   }
 
-  private pauseMemberPlan(room: GroupRecord, work: Work, alias: string, question: string, next?: string) {
+  private pauseMemberPlan(room: GroupRecord, work: Parameters<Groups['currentTask']>[1] & Pick<Work, 'id'>, alias: string, question: string, next?: string) {
     const text = next ? '后续步骤等待重新安排，成员已移出 · ' + alias + ' → ' + next : '本轮跟进暂停，成员已移出 · ' + alias;
     const task = this.currentTask(room, work);
     if (task) task.state = 'paused';
@@ -1150,25 +1263,34 @@ export class Groups {
     this.nextMember(room, work, batch, base.id, resume);
   }
 
-  private startParallel(room: GroupRecord, work: Pick<Work, 'id' | 'root' | 'remaining' | 'contextReads'>, batch: MemberStep[], question: string, resume: boolean) {
+  private startParallel(room: GroupRecord, work: Pick<Work, 'id' | 'root' | 'remaining' | 'contextReads' | 'template'>, batch: MemberStep[], question: string, resume: boolean) {
     const [left, right] = batch.map(step => room.members.find(member => enrollmentOf(member) === step.enrollment));
     if (!left || !right || left === right) return false;
     const targets = [memberTarget(left), memberTarget(right)];
     if (targetKey(targets[0]!.engine, targets[0]!.target) === targetKey(targets[1]!.engine, targets[1]!.target)) return false;
     batch.forEach((step, index) => this.plan(room, { ...targets[index]!, question, kind: 'member', root: work.root,
       prompt: step.text, sources: step.sources, contextReads: work.contextReads, remaining: work.remaining - batch.length,
-      resume, automated: true, parallelBatch: work.id }));
+      resume, automated: true, parallelBatch: work.id, template: work.template }));
     return true;
   }
 
-  private nextMember(room: GroupRecord, work: Work, batch: NonNullable<Work['batch']>, question: string, resume: boolean) {
+  private nextMember(room: GroupRecord, work: Pick<Work, 'id' | 'root' | 'remaining' | 'contextReads' | 'roster' | 'template' | 'automated' | 'kind' | 'version' | 'taskRevision'>,
+    batch: MemberStep[], question: string, resume: boolean) {
     const [first, ...later] = bindSteps(batch, work.roster ?? rosterOf(room));
     if (!first || !work.remaining) return;
     const member = room.members.find(item => enrollmentOf(item) === first.enrollment);
     if (!member) { this.pauseMemberPlan(room, work, first.member, question, later[0]?.member); return; }
     this.plan(room, { ...memberTarget(member), question, kind: 'member', root: work.root,
-      prompt: first.text, sources: first.sources, contextReads: work.contextReads,
-      remaining: work.remaining - 1, resume, batch: later, automated: true });
+      prompt: first.text, sources: first.followsPrevious ? [question, ...(first.sources || [])] : first.sources, contextReads: work.contextReads,
+      remaining: work.remaining - 1, resume, batch: later, automated: true, template: work.template });
+  }
+
+  private summarizeBatch(room: GroupRecord, work: Work, question: string, sources: string[]) {
+    if (!room.sessionId || !work.resume) return;
+    this.plan(room, { engine: room.engine, target: room.sessionId, question, kind: 'host',
+      prompt: 'Summarize the member results, including any failed or interrupted branch.',
+      sources: work.template ? [work.root, ...sources] : sources,
+      contextReads: work.contextReads, remaining: 0, root: work.root, resume: false, summaryOnly: true });
   }
 
   private acceptReceipt(work: Work, turn: UnifiedTurn) {
@@ -1203,13 +1325,15 @@ export class Groups {
         this.append(room, { ...base, kind: 'member', text });
         if (!room.paused && this.currentTask(room, work)?.state === 'open' && work.parallelBatch) {
           const batch = this.taskWork(room.id, work.root).filter(item => item.parallelBatch === work.parallelBatch);
-          if (work.resume && room.sessionId && batch.every(item => item.id === work.id || item.state === 'done')) {
-            this.plan(room, { engine: room.engine, target: room.sessionId, question: base.id, kind: 'host',
-              prompt: 'Summarize the two member results, including any failed or interrupted branch.', sources: batch.map(item => item.id + '/reply'),
-              contextReads: work.contextReads, remaining: 0, root: work.root, resume: false, summaryOnly: true });
-          }
+          if (batch.every(item => item.id === work.id || item.state === 'done')) this.summarizeBatch(room, work, base.id, batch.map(item => item.id + '/reply'));
+        } else if (!room.paused && this.currentTask(room, work)?.state === 'open' && work.template && !work.batch?.length) {
+          const batch = this.taskWork(room.id, work.root).filter(item => item.template && taskRevision(item) === taskRevision(work));
+          this.summarizeBatch(room, work, base.id, batch.map(item => item.id + '/reply'));
         } else if (!room.paused && this.currentTask(room, work)?.state === 'open' && turn.status === 'completed') {
-          if (work.batch?.length) this.nextMember(room, work, work.batch, base.id, work.resume);
+          if (work.batch?.[0]?.followsPrevious && !replyOf(turn).trim()) {
+            this.currentTask(room, work)!.state = 'waiting';
+            this.append(room, { ...base, id: work.id + '/empty-evidence', kind: 'notice', author: '', text: '证据复核等待第一位成员的实际回复' });
+          } else if (work.batch?.length) this.nextMember(room, work, work.batch, base.id, work.resume);
           else if (work.resume && room.sessionId) {
             this.plan(room, { engine: room.engine, target: room.sessionId, question: base.id, kind: 'host',
               prompt: resumeAfterMembers,
