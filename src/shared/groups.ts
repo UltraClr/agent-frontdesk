@@ -92,13 +92,13 @@ export interface GroupDelivery {
   attention?: Pick<Approval, 'id' | 'title' | 'kind'>;
 }
 
-export type GroupDispatchStep = { member: string; deliveryId: string }
+export type GroupDispatchStep = { member: string; deliveryId: string; parallelBatch?: string }
   | { member: string; engine?: string; creatingMember: boolean; state: 'planned' | 'paused' | 'cancelled' | 'previous-failed' | 'removed' | 'not-sent' };
 
 export interface GroupTask {
   id: string;
   revision: number;
-  state: 'queued' | 'confirming' | 'running' | 'waiting' | 'blocked' | 'paused' | 'completed' | 'cancelled' | 'failed';
+  state: 'queued' | 'confirming' | 'running' | 'waiting' | 'blocked' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed';
   request: string;
   dispatchPlan: GroupDispatchStep[];
   deliveries: GroupDelivery[];

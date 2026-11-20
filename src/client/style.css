@@ -2313,6 +2313,9 @@ a.coordinator-task:focus-visible { outline-offset: -2px; }
 .group-plan > li + li { border-block-start: 1px solid var(--border); }
 .group-plan-number { display: grid; place-items: center; width: 18px; height: 18px; margin-block-start: 10px; border-radius: 50%; background: var(--surface); color: var(--muted); font-variant-numeric: tabular-nums; }
 .group-plan .group-delivery { padding-inline: 0; }
+.group-plan > .group-plan-parallel { display: block; padding-block: 6px; }
+.group-plan-parallel > strong { color: var(--muted); font-size: 12px; }
+.group-plan-parallel > div { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr)); gap: 0 12px; }
 .group-task-body > button { display: inline-flex; gap: 5px; align-items: center; margin-block-start: 6px; padding: 4px 7px; border: 0; background: none; border-radius: 7px; color: var(--muted); font-size: 12px; }
 .group-task-body > button:hover { background: var(--hover); color: var(--text); }
 .group-task-body > button .lucide { width: 13px; height: 13px; }

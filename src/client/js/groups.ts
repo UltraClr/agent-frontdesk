@@ -7,11 +7,11 @@ import { character, escape, hydrateIcons, icon, markdown } from './renderers.js'
 type Page = { items: GroupSummary[]; nextOffset: number | null };
 type Agent = { id: string; label: string };
 type TaskAction = 'start' | 'supplement' | 'replace';
-type Draft = { text: string; member: string; replyTo: string; key?: string; taskAction?: TaskAction; taskId?: string; taskRevision?: number };
+type Draft = { text: string; member: string; replyTo: string; key?: string; taskAction?: TaskAction; taskId?: string; taskRevision?: number; allowParallel?: boolean };
 const activeTaskStates = new Set(['queued', 'confirming', 'running', 'waiting', 'blocked', 'paused']);
 const taskLabels = {
   queued: '等待投递', confirming: '正在确认桌面记录', running: '正在推进', waiting: '等待用户操作', blocked: '群任务受阻',
-  paused: '群任务已暂停', completed: '群任务已完成', cancelled: '已停止后续派发', failed: '群任务未完成',
+  paused: '群任务已暂停', completed: '群任务已完成', partial: '部分成员已完成', cancelled: '已停止后续派发', failed: '群任务未完成',
 } as const;
 const receiptOutcomes = { completed: '原生轮次已结束', failed: '原会话任务失败', interrupted: '原会话任务已停止', cancelled: '已撤销待投递消息' } as const;
 const taskTone = (state: string) => state === 'completed' ? 'positive'
@@ -196,6 +196,7 @@ export class GroupPanel {
   private readonly input: HTMLTextAreaElement;
   private readonly receiver: HTMLSelectElement;
   private readonly taskAction: HTMLSelectElement;
+  private readonly dispatchMode: HTMLSelectElement;
   private readonly dialog: HTMLDialogElement;
 
   constructor(readonly panel: HTMLElement, private sidebar: HTMLElement, private currentEngine: () => string,
@@ -227,6 +228,7 @@ export class GroupPanel {
         <div class="group-composer-toolbar">
           <label><span>${t('发送给')}</span><span class="group-select">${icon('at-sign')}<select aria-label="${t('收件人')}"></select>${icon('chevron-down')}</span></label>
           <label data-group-task-action hidden><span>${t('任务操作')}</span><span class="group-select"><select aria-label="${t('任务操作')}"></select>${icon('chevron-down')}</span></label>
+          <label data-group-dispatch-mode><span>${t('派发方式')}</span><span class="group-select"><select aria-label="${t('派发方式')}"><option value="">${t('按顺序')}</option><option value="parallel">${t('允许并行')}</option></select>${icon('chevron-down')}</span></label>
           <button class="primary-button group-send" type="submit">${icon('arrow-up')}<span>${t('发送')}</span></button>
         </div>
       </form>
@@ -241,6 +243,7 @@ export class GroupPanel {
     this.input = panel.querySelector('textarea')!;
     this.receiver = panel.querySelector('select')!;
     this.taskAction = panel.querySelector('[data-group-task-action] select')!;
+    this.dispatchMode = panel.querySelector('[data-group-dispatch-mode] select')!;
     this.dialog = panel.querySelector('dialog')!;
     document.body.append(this.dialog);
     this.list = document.createElement('div');
@@ -269,6 +272,11 @@ export class GroupPanel {
     });
     this.input.addEventListener('input', () => { this.draft.key = undefined; this.save(); });
     this.receiver.addEventListener('change', () => this.changeRecipient());
+    this.dispatchMode.addEventListener('change', () => {
+      this.draft.allowParallel = this.dispatchMode.value === 'parallel';
+      this.draft.key = undefined;
+      this.save();
+    });
     this.taskAction.addEventListener('change', () => {
       const action = this.taskAction.value as TaskAction | '';
       const task = this.room?.task;
@@ -521,12 +529,28 @@ export class GroupPanel {
     const planIds = new Set(plan.flatMap(step => 'deliveryId' in step ? [step.deliveryId] : []));
     const active = plan.find(step => 'deliveryId' in step && deliveries.get(step.deliveryId)?.state !== 'done');
     const current = active && 'deliveryId' in active ? deliveries.get(active.deliveryId) : undefined;
-    const now = active && current && task && !room.paused && task.state !== 'paused' && activeTaskStates.has(task.state)
+    const now = active && current && !('parallelBatch' in active) && task && !room.paused && task.state !== 'paused' && activeTaskStates.has(task.state)
       ? this.dispatchStatus(current, active.member) : '';
-    const chain = plan.map(step => step.member).join(' → ');
+    const batches = new Map<string, Extract<GroupDispatchStep, { deliveryId: string }>[]>();
+    for (const step of plan) if ('deliveryId' in step && step.parallelBatch) {
+      const batch = batches.get(step.parallelBatch) || [];
+      batch.push(step); batches.set(step.parallelBatch, batch);
+    }
+    const chain = plan.map((step, index) => {
+      if (!index) return step.member;
+      const prior = plan[index - 1]!;
+      return ('parallelBatch' in step && step.parallelBatch && 'parallelBatch' in prior && step.parallelBatch === prior.parallelBatch ? ' + ' : ' → ') + step.member;
+    }).join('');
+    const receipt = (id: string) => {
+      const item = deliveries.get(id);
+      return item ? this.renderDelivery(room, item) : '';
+    };
     const sequence = plan.map((step, index) => {
-      const delivery = 'deliveryId' in step ? deliveries.get(step.deliveryId) : undefined;
-      const row = 'deliveryId' in step ? delivery && this.renderDelivery(room, delivery) : this.renderPlannedStep(step, index);
+      if ('deliveryId' in step && step.parallelBatch) {
+        const batch = batches.get(step.parallelBatch)!;
+        return batch[0] === step ? `<li class="group-plan-parallel"><strong>${t('并行派发')}</strong><div>${batch.map(item => receipt(item.deliveryId)).join('')}</div></li>` : '';
+      }
+      const row = 'deliveryId' in step ? receipt(step.deliveryId) : this.renderPlannedStep(step, index);
       return row ? `<li><span class="group-plan-number" aria-hidden="true">${index + 1}</span>${row}</li>` : '';
     }).join('');
     const preview = chain || task?.request || '';
@@ -559,6 +583,8 @@ export class GroupPanel {
   }
 
   private updateTaskAction() {
+    this.dispatchMode.closest('label')!.hidden = !!this.receiver.value;
+    this.dispatchMode.value = this.draft.allowParallel ? 'parallel' : '';
     const task = this.room?.task;
     const active = !!task && activeTaskStates.has(task.state);
     const action = this.draft.taskAction;

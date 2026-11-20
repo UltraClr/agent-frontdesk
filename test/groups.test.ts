@@ -85,6 +85,59 @@ function setup(t: TestContext) {
   return { get groups() { return groups; }, get runs() { return runs; }, create, reopen, codex, agy, dsh, directory, host, histories, reads, catalogs, sent, reports, created, finish };
 }
 
+test('parallel branches survive restart, report partial results and request one summary', async t => {
+  const fixture = setup(t);
+  let groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'parallel');
+  await groups.poll();
+  groups.send(id, { key: 'task', text: 'Independently review two items, then summarize', allowParallel: true });
+  await groups.poll();
+  fixture.finish(0, groupAction({ action: 'collect', mode: 'parallel', summarize: true, questions: [
+    { member: 'A', text: 'Review the first item' }, { member: 'B', text: 'Review the second item' },
+  ] }));
+  await groups.poll(); await groups.poll();
+  assert.deepEqual(fixture.sent.slice(1).map(item => item.target), ['dsh:A', 'dsh:B']);
+  const [a, b] = must(groups.progress(id)).dispatchPlan;
+  assert(a && b && 'parallelBatch' in a && a.parallelBatch && 'parallelBatch' in b);
+  assert.equal(a.parallelBatch, b.parallelBatch);
+  const first = must(fixture.sent[1]);
+  const history = must(fixture.histories.get(first.target));
+  history.turns.push(new UnifiedTurn({ id: 'approval-turn', userPrompt: first.prompt, status: 'running',
+    approvals: [{ id: 'approval', title: 'Review command', detail: '', decisions: ['approve'] }] }));
+  fixture.finish(2, 'Second result');
+  await groups.poll();
+  assert.equal(groups.progress(id)?.state, 'waiting');
+  assert.equal(groups.view(id).messages.at(-1)?.text, 'Second result');
+  assert.equal(fixture.sent.length, 3);
+  groups = await fixture.reopen(true);
+  history.turns.splice(0, 1, new UnifiedTurn({ id: 'approval-turn', userPrompt: first.prompt, status: 'failed',
+    statusEvidence: 'native', assistantReply: 'First failed' }));
+  await groups.poll(); await groups.poll();
+  assert.equal(fixture.sent.length, 4);
+  assert.match(must(fixture.sent[3]).prompt, /Second result/);
+  assert.match(must(fixture.sent[3]).prompt, /First failed/);
+  fixture.finish(3, groupAction({ action: 'summary', text: 'Second result only' }));
+  await groups.poll(); await groups.poll();
+  assert.equal(groups.progress(id)?.state, 'partial');
+  assert.equal(fixture.sent.length, 4);
+});
+
+test('an unapproved parallel request falls back to sequential collection', async t => {
+  const fixture = setup(t), groups = await fixture.reopen();
+  const { id } = await fixture.create(fixture.codex, 'serial');
+  await groups.poll();
+  groups.send(id, { key: 'task', text: 'Follow the two steps in order' });
+  await groups.poll();
+  fixture.finish(0, groupAction({ action: 'collect', mode: 'parallel', questions: [
+    { member: 'A', text: 'First' }, { member: 'B', text: 'Second' },
+  ] }));
+  await groups.poll(); await groups.poll();
+  assert.deepEqual(fixture.sent.slice(1).map(item => item.target), ['dsh:A']);
+  fixture.finish(1, 'First result');
+  await groups.poll(); await groups.poll();
+  assert.equal(fixture.sent[2]?.target, 'dsh:B');
+});
+
 test('mixed agents can join as fresh or existing members and only a recipient gets a native chat', async t => {
   const fixture = setup(t);
   let groups = await fixture.reopen();

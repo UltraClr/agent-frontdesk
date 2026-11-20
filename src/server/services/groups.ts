@@ -15,8 +15,8 @@ type ReportBinding = { engine: string; id: string; origin?: string };
 type RecordReport = (binding: ReportBinding, id: string, text: string) => void;
 type RosterEntry = { alias: string; enrollment: string };
 type MemberStep = { member: string; text: string; sources?: string[]; enrollment?: string | null };
-type TaskState = 'open' | 'waiting' | 'paused' | 'completed' | 'cancelled' | 'failed';
-type StoredTask = { id: string; revision: number; state: TaskState };
+type TaskState = 'open' | 'waiting' | 'paused' | 'completed' | 'partial' | 'cancelled' | 'failed';
+type StoredTask = { id: string; revision: number; state: TaskState; allowParallel?: boolean };
 
 interface GroupRecord {
   id: string;
@@ -55,6 +55,8 @@ interface Work extends GroupDelivery {
   resume: boolean;
   binding?: ReportBinding;
   batch?: MemberStep[];
+  parallelBatch?: string;
+  summaryOnly?: boolean;
   roster?: RosterEntry[];
   sources?: string[];
   included?: string[];
@@ -215,6 +217,7 @@ export class Groups {
     const memberWorks = works.filter(work => work.automated && work.kind === 'member' && taskRevision(work) === task.revision);
     const steps: GroupDispatchStep[] = memberWorks.map(work => ({
       member: workMember(room, work)?.alias || this.host.engines.get(work.engine)?.label || work.engine, deliveryId: work.id,
+      ...(work.parallelBatch && { parallelBatch: work.parallelBatch }),
     }));
     const last = memberWorks.at(-1);
     if (!last?.batch?.length) return steps;
@@ -581,6 +584,8 @@ export class Groups {
           this.updateWork(work);
         }
       }
+      if (room.task?.state === 'paused' && this.taskWork(room.id, room.task.id).some(work =>
+        work.parallelBatch && work.formerMember && taskRevision(work) === room.task!.revision)) this.finishUnsent(room, room.task.id);
       room.members = [...retained, ...added];
       room.updated = Date.now();
       this.setRoom(room);
@@ -753,7 +758,7 @@ export class Groups {
   }
 
   private plan(room: GroupRecord, data: Pick<Work, 'engine' | 'target' | 'question' | 'kind' | 'prompt' | 'root' | 'remaining' | 'resume'> &
-    Partial<Pick<Work, 'binding' | 'batch' | 'automated' | 'channelReport' | 'memberId' | 'enrollment' | 'sources' | 'contextReads' | 'moreMemberReplies' | 'taskId' | 'taskRevision' | 'supplement'>>) {
+    Partial<Pick<Work, 'binding' | 'batch' | 'parallelBatch' | 'summaryOnly' | 'automated' | 'channelReport' | 'memberId' | 'enrollment' | 'sources' | 'contextReads' | 'moreMemberReplies' | 'taskId' | 'taskRevision' | 'supplement'>>) {
     const task = room.task?.id === data.root && (data.kind === 'host' || data.automated) ? room.task : undefined;
     const work: Work = { ...(task && { taskId: task.id, taskRevision: task.revision }), ...data,
       id: randomUUID(), groupId: room.id, state: 'queued', nativeTurn: null, dispatched: null, note: '', version: room.version };
@@ -841,6 +846,7 @@ export class Groups {
               text: '已替换任务并停止原任务的后续派发', replyTo: prior.id, taskId: prior.id, taskRevision: prior.revision });
           }
         }
+        room.task.allowParallel = get(args, 'allowParallel') === true;
         room.version++;
         if (prior) this.finishUnsent(room, prior.id);
         task = room.task;
@@ -953,10 +959,13 @@ export class Groups {
     this.updateWork(work);
     room.pending = Math.max(0, room.pending - 1);
     const task = this.currentTask(room, work);
-    if (task?.state === 'open' && !this.taskWork(room.id, task.id).some(item =>
-      hosted(item) && item.version === work.version && item.state !== 'done')) {
-      task.state = outcome === 'completed' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
-    }
+    if (task?.state !== 'open') return;
+    const current = this.taskWork(room.id, task.id).filter(item => hosted(item) && item.version === work.version);
+    if (current.some(item => item.state !== 'done')) return;
+    const parallel = current.filter(item => item.parallelBatch);
+    const failedBranch = parallel.some(item => item.outcome !== 'completed');
+    task.state = failedBranch ? parallel.some(item => item.outcome === 'completed') ? 'partial' : 'failed'
+      : outcome === 'completed' ? 'completed' : outcome === 'cancelled' ? 'cancelled' : 'failed';
   }
 
   private pauseMemberPlan(room: GroupRecord, work: Work, alias: string, question: string, next?: string) {
@@ -1038,9 +1047,13 @@ export class Groups {
       'In the final answer, put optional display text before exactly one fenced frontdesk block. In that block return a JSON object with one of these actions:',
       '{"action":"ask","member":"exact alias","text":"self-contained question","sources":["optional group message ID"]} (the answer needs your judgment)',
       '{"action":"collect","questions":[{"member":"alias","text":"self-contained question","sources":["optional group message ID"]}],"summarize":false} (fixed order; set summarize to true only if asked)',
+      this.currentTask(room, work)?.allowParallel
+        ? 'For exactly two independent questions to distinct members, use collect with "mode":"parallel". Keep dependent work sequential. Set summarize to true only if the user asked for a summary.'
+        : 'Keep all member dispatch sequential.',
       '{"action":"read","member":"optional exact author alias","scope":"task"} (read unseen replies from this task and revision without contacting anyone; use scope "group" only when the user explicitly asks for replies across tasks)',
       '{"action":"summary","text":"conclusion","replaces":"optional prior decision id","sources":["cited group message id"]} or {"action":"wait","text":"question for the user"}',
       'Ask or collect only if the user authorized contacting members and remaining is positive. For member tasks, cite only the sources that the recipient needs.',
+      ...(work.summaryOnly ? ['This turn is for the requested summary. Use the supplied member results and report any branch that did not complete. Return only a summary or wait action.'] : []),
       JSON.stringify({
         group: room.name, topic: room.topic, members: work.roster.map(item => item.alias), request: work.prompt.slice(0, 12000),
         requestId: work.root, taskRevision: taskRevision(work), remaining: work.remaining, remainingReads: maxContextReads - (work.contextReads || 0),
@@ -1067,7 +1080,7 @@ export class Groups {
       this.append(room, { ...base, text: (turn.error || reply).slice(0, 12000) });
       return;
     }
-    if (type === 'read') {
+    if (type === 'read' && !work.summaryOnly) {
       const reads = work.contextReads || 0;
       const sources = reads < maxContextReads ? this.newMemberReplies(room, work.target,
         { task: get(action, 'scope') === 'group' ? undefined : work, member: bounded(get(action, 'member'), 80) }) : [];
@@ -1100,7 +1113,7 @@ export class Groups {
     const questions = type === 'ask' ? [action] : type === 'collect' ? list(get(action, 'questions')) : [];
     const batch = bindSteps(questions.map(item => ({ member: bounded(get(item, 'member'), 80), text: bounded(get(item, 'text'), 6000),
       sources: list(get(item, 'sources')).slice(0, 4).map(id => bounded(id, 400)).filter(Boolean) })), work.roster ?? rosterOf(room));
-    const valid = batch.length > 0 && batch.length <= work.remaining &&
+    const valid = !work.summaryOnly && batch.length > 0 && batch.length <= work.remaining &&
       batch.every(item => item.text && item.enrollment);
     if (!valid) {
       task.state = 'waiting';
@@ -1110,7 +1123,21 @@ export class Groups {
       return;
     }
     this.append(room, { ...base, text: reply.slice(0, structure?.index).trim() || batch.map(item => '@' + item.member + ' ' + item.text).join('\n') });
-    this.nextMember(room, work, batch, base.id, type === 'ask' || get(action, 'summarize') === true);
+    const resume = type === 'ask' || get(action, 'summarize') === true;
+    if (type === 'collect' && task.allowParallel && get(action, 'mode') === 'parallel' && batch.length === 2 &&
+      this.startParallel(room, work, batch, base.id, resume)) return;
+    this.nextMember(room, work, batch, base.id, resume);
+  }
+
+  private startParallel(room: GroupRecord, work: Pick<Work, 'id' | 'root' | 'remaining' | 'contextReads'>, batch: MemberStep[], question: string, resume: boolean) {
+    const [left, right] = batch.map(step => room.members.find(member => enrollmentOf(member) === step.enrollment));
+    if (!left || !right || left === right) return false;
+    const targets = [memberTarget(left), memberTarget(right)];
+    if (targetKey(targets[0]!.engine, targets[0]!.target) === targetKey(targets[1]!.engine, targets[1]!.target)) return false;
+    batch.forEach((step, index) => this.plan(room, { ...targets[index]!, question, kind: 'member', root: work.root,
+      prompt: step.text, sources: step.sources, contextReads: work.contextReads, remaining: work.remaining - batch.length,
+      resume, automated: true, parallelBatch: work.id }));
+    return true;
   }
 
   private nextMember(room: GroupRecord, work: Work, batch: NonNullable<Work['batch']>, question: string, resume: boolean) {
@@ -1153,7 +1180,14 @@ export class Groups {
       } else {
         const text = (turn.error || replyOf(turn)).slice(0, 12000) || (turn.status === 'interrupted' ? '桌面记录显示任务已停止' : turn.status === 'failed' ? '桌面记录显示任务执行失败' : '桌面已结束这一轮');
         this.append(room, { ...base, kind: 'member', text });
-        if (!room.paused && this.currentTask(room, work)?.state === 'open' && turn.status === 'completed') {
+        if (!room.paused && this.currentTask(room, work)?.state === 'open' && work.parallelBatch) {
+          const batch = this.taskWork(room.id, work.root).filter(item => item.parallelBatch === work.parallelBatch);
+          if (work.resume && room.sessionId && batch.every(item => item.id === work.id || item.state === 'done')) {
+            this.plan(room, { engine: room.engine, target: room.sessionId, question: base.id, kind: 'host',
+              prompt: 'Summarize the two member results, including any failed or interrupted branch.', sources: batch.map(item => item.id + '/reply'),
+              contextReads: work.contextReads, remaining: 0, root: work.root, resume: false, summaryOnly: true });
+          }
+        } else if (!room.paused && this.currentTask(room, work)?.state === 'open' && turn.status === 'completed') {
           if (work.batch?.length) this.nextMember(room, work, work.batch, base.id, work.resume);
           else if (work.resume && room.sessionId) {
             this.plan(room, { engine: room.engine, target: room.sessionId, question: base.id, kind: 'host',

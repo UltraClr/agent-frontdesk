@@ -69,6 +69,8 @@ const EN: Record<string, string> = {
   '已移出群聊': 'Removed from group',
   '已撤销待投递消息，成员已移出': 'Unsent message withdrawn after removal',
   '查看任务进度': 'View task progress', '正在推进': 'In progress', '群任务受阻': 'Group task blocked',
+  '派发方式': 'Dispatch mode', '按顺序': 'Sequential', '允许并行': 'Allow parallel dispatch', '并行派发': 'Parallel dispatch',
+  '部分成员已完成': 'Some members completed',
   '派发顺序': 'Dispatch order', '待派发': 'Pending dispatch', '未派发': 'Not dispatched',
   '等第 {n} 步成功完成': 'After step {n} succeeds', '前一步未成功完成': 'Previous step did not succeed',
   '首次派发时新建专用会话': 'Creates a dedicated chat on first dispatch',
