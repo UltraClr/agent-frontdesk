@@ -259,6 +259,27 @@ export class Coordinator {
 
   tasks(engine: Engine) { const state = this.state(engine); return state ? this.collaborationList(state) : []; }
 
+  inbox(engine: Engine): InboxSignal[] {
+    if (!engine.coordinator?.root) return [];
+    const state = this.state(engine);
+    if (!state?.sessionId) return [];
+    const source = { href: '#coordinator/' + encodeURIComponent(engine.id), title: engine.label };
+    const items: InboxSignal[] = [];
+    for (const task of state.tasks) {
+      if (task.owner !== state.sessionId) continue;
+      const native = { engine: task.engine, sessionId: task.target, sessionTitle: task.title,
+        turnId: task.nativeTurn, since: task.since, source };
+      if (task.phase === 'waiting-user' && task.attention) items.push({
+        ...native, requestId: task.attention.id, kind: task.attention.kind || 'approval',
+      });
+      if (task.phase === 'not-sent' || task.phase === 'return-failed' ||
+        (task.phase === 'sent' && !task.nativeTurn && Date.now() - task.since >= 60_000)) items.push({
+        ...native, kind: 'delivery', operationId: task.id, title: task.error,
+      });
+    }
+    return items;
+  }
+
   private collaborations(state: Workspace): Collaboration[] {
     return (state.links || []).filter(link => link.owner === state.sessionId);
   }
@@ -693,3 +714,4 @@ export class Coordinator {
     }
   }
 }
+import type { InboxSignal } from '../../shared/inbox.js';

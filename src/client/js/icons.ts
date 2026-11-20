@@ -35,6 +35,7 @@ import FolderOpen from 'lucide/dist/esm/icons/folder-open.js';
 import FolderSearch from 'lucide/dist/esm/icons/folder-search.js';
 import GripVertical from 'lucide/dist/esm/icons/grip-vertical.js';
 import History from 'lucide/dist/esm/icons/history.js';
+import Inbox from 'lucide/dist/esm/icons/inbox.js';
 import Info from 'lucide/dist/esm/icons/info.js';
 import ListChecks from 'lucide/dist/esm/icons/list-checks.js';
 import ListFilter from 'lucide/dist/esm/icons/list-filter.js';
@@ -67,7 +68,7 @@ import X from 'lucide/dist/esm/icons/x.js';
 // By the name lucide gives each icon ("file-check-2" is "FileCheck2"): replaceElement looks them up so.
 const drawn: Record<string, unknown> = {
   AppWindow, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, AtSign, BookmarkPlus, BookOpen, Bot, Check, ChevronDown, ChevronRight, ChevronsRight, CircleAlert, CircleStop, Clock3, Code, Copy,
-  Download, Ellipsis, ExternalLink, File, FileCheck2, FileText, Folder, FolderOpen, FolderSearch, GripVertical, History, Info, ListChecks, ListFilter, ListPlus,
+  Download, Ellipsis, ExternalLink, File, FileCheck2, FileText, Folder, FolderOpen, FolderSearch, GripVertical, History, Inbox, Info, ListChecks, ListFilter, ListPlus,
   Mail, MessageSquareQuote, MessagesSquare, Mic, MonitorSmartphone, Network, PanelLeft, PanelLeftClose, PanelRight, Pencil, Plus, RefreshCw, ScanLine, Search, Send,
   Settings, Sparkles, Square, SquarePen, Terminal, TextCursorInput, UsersRound, Wrench, X,
 };

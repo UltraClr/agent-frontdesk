@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { CreateInput, CreateResult, Engine, FrontdeskSessionRole, TimeValue, UnifiedSession, UnifiedTurn } from '../../shared/contract.js';
 import type { GroupDelivery, GroupDispatchStep, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupState, GroupSummary, GroupTask, GroupView } from '../../shared/groups.js';
+import type { InboxSignal } from '../../shared/inbox.js';
 import { errorField, failure, get, list, messageOf, str } from '../../shared/guards.js';
 import { promptStarts } from '../../shared/turn-match.js';
 import { sessionBusy, type RunService } from '../core/run-service.js';
@@ -252,6 +253,26 @@ export class Groups {
   }
 
   progress(id: string) { return this.taskSnapshot(this.record(id)); }
+
+  inbox(): InboxSignal[] {
+    const rows = this.store().prepare(`SELECT w.data, r.data AS room FROM group_work w JOIN rooms r ON r.id=w.room
+      WHERE w.state IN ('waiting','blocked') OR (w.state='sent' AND json_extract(w.data,'$.nativeTurn') IS NULL
+      AND json_extract(w.data,'$.dispatched') <= ?)`).all(Date.now() - 60_000);
+    return rows.flatMap<InboxSignal>(row => {
+      const room = JSON.parse(String(row.room)) as GroupRecord;
+      const work = this.delivery(room, JSON.parse(String(row.data)) as Work);
+      const source = { href: '#group/' + encodeURIComponent(room.id), title: room.name };
+      const signal = { engine: work.engine, sessionId: work.creatingMember ? undefined : work.target, turnId: work.nativeTurn || undefined,
+        since: work.dispatched || room.updated, source };
+      if (work.state === 'waiting' && work.attention && signal.sessionId) return [{
+        ...signal, sessionId: signal.sessionId, requestId: work.attention.id, title: work.attention.title, kind: work.attention.kind || 'approval',
+      } satisfies InboxSignal];
+      if (work.state === 'blocked' || (work.state === 'sent' && !work.nativeTurn)) return [{
+        ...signal, kind: 'delivery', operationId: work.id, title: work.note,
+      } satisfies InboxSignal];
+      return [];
+    });
+  }
 
   view(id: string, before?: number): GroupView {
     const room = this.record(id);

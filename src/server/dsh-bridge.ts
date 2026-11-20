@@ -367,6 +367,13 @@ export class DshBridge {
     return sessions;
   }
 
+  async listWaiting(): Promise<import('../shared/inbox.js').NativePendingRequest[]> {
+    return (await this.rows(true)).flatMap(row => row.questions.map(question => ({
+      sessionId: row.id, requestId: this.card(row.id, question).id, kind: 'input' as const,
+      sessionTitle: row.title, project: row.cwd,
+    })));
+  }
+
   private toSession(row: Row, workspace: Workspace | null, rank: number | undefined): UnifiedSession {
     const recent = this.recent.get(row.id);
     const metadata: UnifiedSession['metadata'] = {

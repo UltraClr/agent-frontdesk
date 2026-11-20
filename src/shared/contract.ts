@@ -435,6 +435,8 @@ export interface EngineMethods {
   status(): Awaitable<EngineStatus>;
   models(): Awaitable<Model[]>;
   list(): Awaitable<UnifiedSession[]>;
+  /** Pending requests from lightweight native metadata, without reading conversation history. */
+  listWaiting?(): Awaitable<import('./inbox.js').NativePendingRequest[]>;
   read(id: string): Awaitable<History>;
   create(input: CreateInput): Awaitable<CreateResult>;
   send(id: string, input: SendInput): EngineEmitter;

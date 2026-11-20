@@ -329,6 +329,22 @@ class CodexBridge extends EventEmitter {
     return (await this.projectTree()).projects.map(project => ({ id: project.id, name: project.name, cwd: project.roots[0] || '', ...(project.pinned && { pinned: true }) }));
   }
 
+  async listWaiting(): Promise<import('../shared/inbox.js').NativePendingRequest[]> {
+    await this.start();
+    return (await this.listAll('thread/list', { archived: false })).flatMap<import('../shared/inbox.js').NativePendingRequest>(row => {
+      const sessionId = text(get(row, 'id'));
+      if (!sessionId) return [];
+      const flags = list(get(row, 'status', 'activeFlags'));
+      const cards = [...(this.live.get(sessionId)?.asks.values() || [])];
+      const identity = { sessionId, sessionTitle: this.titleOf(row), project: text(get(row, 'cwd')) };
+      if (cards.length) return cards.map(({ card }) => ({
+        ...identity, requestId: card.id, kind: card.kind || 'approval' as const, title: card.title,
+      }));
+      const kind = flags.includes('waitingOnUserInput') ? 'input' as const : flags.includes('waitingOnApproval') ? 'approval' as const : undefined;
+      return kind ? [{ ...identity, kind }] : [];
+    });
+  }
+
   async coordinationCatalog(cwd?: string) {
     await this.start();
     const [rows, tree] = await Promise.all([this.listAll('thread/list', { archived: false }), this.projectTree()]);

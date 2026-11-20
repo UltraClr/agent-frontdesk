@@ -48,7 +48,7 @@ export const setup: PluginSetup = ({ config, registerEngine }) => {
       defaultModel: () => bridge.coordinationDefaultModel(), modelForSend: session => session.metadata.desktop?.model },
     dictate: options => bridge.dictate(options), dictationReady: () => bridge.dictationReady(),
     status: () => bridge.getStatus(), models: () => bridge.getModels(),
-    list: () => bridge.listConversations(), read: id => bridge.getConversationHistory(id),
+    list: () => bridge.listConversations(), listWaiting: () => bridge.listWaiting(), read: id => bridge.getConversationHistory(id),
     // agentapi creates and starts a conversation in a single operation.
     create: input => bridge.newConversation(input),
     observe: id => bridge.observe(id),

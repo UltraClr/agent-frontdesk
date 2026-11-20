@@ -2172,6 +2172,21 @@ a.coordinator-task:focus-visible { outline-offset: -2px; }
 .coordinator-channel:hover { color: var(--text); background: var(--surface); }
 .coordinator-channel .lucide { width: 14px; height: 14px; }
 .coordinator-channel .lucide:last-child { margin-left: auto; }
+.coordinator-inbox { color: var(--text); font-weight: 600; }
+.inbox-dialog { width: min(620px, calc(100vw - 24px)); }
+.inbox-controls, .inbox-item-heading, .inbox-links { display: flex; align-items: center; gap: 8px; }
+.inbox-content { display: grid; gap: 18px; }
+.inbox-content h3 { font-size: 13px; margin-block: 0 8px; }
+.inbox-content ul { list-style: none; padding: 0; margin: 0; }
+.inbox-item { padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; overflow-wrap: anywhere; }
+.inbox-item + .inbox-item { margin-block-start: 6px; }
+.inbox-item-heading { justify-content: space-between; flex-wrap: wrap; }
+.inbox-item small, .inbox-status, .inbox-empty, .inbox-coverage { color: var(--muted); font-size: 12px; }
+.inbox-item p { margin-block: 6px; }
+.inbox-links { flex-wrap: wrap; margin-block-start: 6px; }
+.inbox-links a { display: inline-flex; align-items: center; gap: 3px; color: var(--accent); }
+.inbox-links .lucide { width: 13px; height: 13px; }
+.inbox-coverage li { display: flex; justify-content: space-between; gap: 8px; margin-block-start: 5px; }
 .coordinator-location { color: var(--muted); font-size: 12px; }
 .coordinator-location summary { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 5px; border-radius: 6px; cursor: pointer; }
 .coordinator-location summary::-webkit-details-marker { display: none; }

@@ -95,6 +95,7 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
       } },
     status: () => bridge.getStatus(), models: () => bridge.getModels(),
     list: listAll,
+    listWaiting: () => bridge.listWaiting(),
     projects: async () => [...await bridge.listProjects(), ...mode().projects.map(project => ({ ...project, space: 'chatgpt' }))],
     // A ChatGPT conversation: its messages read from the desktop's window.
     read: id => { const item = remote(id); return item ? chats.read(asSession(item, 0), item.updatedAt) : bridge.getThread(id); },

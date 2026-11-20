@@ -514,6 +514,19 @@ class AntigravityBridge extends EventEmitter {
     }));
   }
 
+  async listWaiting(): Promise<import('../shared/inbox.js').NativePendingRequest[]> {
+    const busy = this.summaries().filter(row => this.sessionOf(row).status === 'busy');
+    return (await Promise.all(busy.map(async row => {
+      const session = this.sessionOf(row);
+      const requests = await this.openRequests(session.id, row);
+      return requests.flatMap(({ index, step }) => {
+        const card = this.askOf(session.id, index, step, false);
+        return card ? [{ sessionId: session.id, sessionTitle: session.title, project: session.cwd,
+          requestId: card.id, title: card.title, kind: card.kind || 'approval' as const, desktopOnly: card.kind === 'input' }] : [];
+      });
+    }))).flat();
+  }
+
   async parseTranscript(file: string): Promise<ParsedHistory> {
     const lines = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
     const records = (async function* () { for await (const line of lines) { if (!line.trim()) continue; try { yield parseJson(line); } catch {} } })();

@@ -60,6 +60,7 @@ export const setup: PluginSetup = ({ config, registerEngine, registerAsset }) =>
     models: () => bridge.getModels(),
     usage: () => bridge.getUsage(),
     list: () => bridge.list(),
+    listWaiting: () => bridge.listWaiting(),
     projects: () => bridge.projects(),
     read: id => bridge.read(id),
     // A new chat is created in the desktop app (its own Session API) with the folder the person picked.

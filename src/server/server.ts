@@ -14,6 +14,7 @@ import { AgentLooks, AVATAR_MAX_BYTES } from './core/agent-looks.js';
 import { EventHub } from './core/event-hub.js';
 import { RunService } from './core/run-service.js';
 import { ActivityFeed } from './services/activity-feed.js';
+import { Inbox } from './services/inbox.js';
 import { UsageService } from './services/usage-service.js';
 import { SessionObserver } from './services/session-observer.js';
 import { Groups } from './services/groups.js';
@@ -347,6 +348,11 @@ async function createApp({ config = loadConfig(), host: given, hub = new EventHu
     (binding, id, report) => { if (binding.origin) weixin.groupReport(binding.engine, binding.id, binding.origin, id, report); },
     binding => coordinator.isSession(binding.engine, binding.id));
   coordinator.groups = groups;
+  const inbox = new Inbox(host, () => [...activity.pendingRequests(), ...groups.inbox(),
+    ...[...host.engines.values()].flatMap(engine => {
+      try { return coordinator.inbox(engine); } catch { return []; }
+    })]);
+  app.get('/api/inbox', async (_req, res) => res.set('Cache-Control', 'no-store').json(await inbox.read()));
   app.get('/api/groups', (req, res) => res.json(groups.search(req.query)));
   app.get('/api/group-engines', (_req, res) => res.json(groups.engines()));
   app.get('/api/group-member-options/:engine', async (req, res) => res.json(await groups.memberOptions(engineOf(req))));

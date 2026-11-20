@@ -2,7 +2,8 @@ import { EventEmitter } from 'node:events';
 import type { PluginHost } from '../core/plugin-host.js';
 import type { EventHub } from '../core/event-hub.js';
 import type { RunService } from '../core/run-service.js';
-import type { ActivityEntry, ActivityNotice, ActivitySnapshot, AnyBridgeEvent } from '../../shared/contract.js';
+import type { ActivityEntry, ActivityNotice, ActivitySnapshot, AnyBridgeEvent, Approval, BridgeEventMap } from '../../shared/contract.js';
+import type { InboxSignal } from '../../shared/inbox.js';
 import { get } from '../../shared/guards.js';
 const terminal = new Set<unknown>(['completed', 'failed', 'interrupted']);
 const stamp = (value: unknown): number => typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : Date.parse(String(value)) || 0;
@@ -15,6 +16,7 @@ class ActivityFeed {
   entries: Map<string, ActivityEntry>; notices: ActivityNotice[]; knownMessages: Map<string, Set<string>>; nativeRunning: Set<string>;
   private waitingWatches = new Map<string, () => void>();
   private readonly baselines = new Map<string, number>();
+  private readonly pending = new Map<string, Extract<InboxSignal, { requestId?: string }>[]>();
   bus: EventEmitter; polling: boolean; timer: ReturnType<typeof setInterval> | null; clients: number; unsubscribe: () => void;
   constructor(host: PluginHost, hub: EventHub, runs: RunService, { intervalMs = 3000 }: { intervalMs?: number } = {}) {
     this.host = host; this.hub = hub; this.runs = runs; this.intervalMs = intervalMs;
@@ -45,6 +47,28 @@ class ActivityFeed {
     return true;
   }
   record(event: AnyBridgeEvent): void {
+    const key = this.hub.key(event.engine, event.sessionId);
+    const prior = this.pending.get(key) || [];
+    const card = (item: Approval, turnId?: string | null) => ({
+      engine: event.engine, sessionId: event.sessionId, requestId: item.id, kind: item.kind || 'approval' as const, title: item.title,
+      turnId: turnId || undefined, since: prior.find(value => value.requestId === item.id)?.since || Date.parse(event.timestamp),
+      desktopOnly: item.decisions.length > 0 && item.decisions.every(choice => (typeof choice === 'string' ? choice : choice.id) === 'desktop'),
+    });
+    if (event.type === 'approval.requested') {
+      const request = event.data as Approval;
+      this.pending.set(key, [...prior.filter(item => item.requestId !== request.id), card(request, event.turnId)]);
+    } else if (event.type === 'approval.resolved') {
+      const remaining = prior.filter(item => item.requestId !== get(event.data, 'id'));
+      if (remaining.length) this.pending.set(key, remaining); else this.pending.delete(key);
+      const activity = this.entries.get(key);
+      if (activity && !remaining.length) delete activity.waitingFor;
+    } else if (event.type === 'session.snapshot') {
+      const turn = (event.data as BridgeEventMap['session.snapshot']).turns.at(-1);
+      const requests = turn?.approvals?.map(item => card(item, turn.id));
+      if (requests?.length) this.pending.set(key, requests); else this.pending.delete(key);
+    } else if (['run.started', 'run.completed', 'run.failed', 'run.interrupted'].includes(event.type)) {
+      this.pending.delete(key);
+    }
     if (event.type === 'assistant.notice' || (event.type === 'message.updated' && get(event.data, 'status') === 'completed')) {
       // Both carry a message: { id, text | preview, phase, at }.
       const data = event.data;
@@ -56,7 +80,7 @@ class ActivityFeed {
     if (event.type === 'approval.requested' || event.type === 'approval.resolved') { this.changed(); return; }
     const ended = ['run.completed', 'run.failed', 'run.interrupted'].includes(event.type);
     if (event.type !== 'run.started' && !ended && event.type !== 'run.connection_lost') return;
-    const key = this.hub.key(event.engine, event.sessionId), previous: Partial<ActivityEntry> = this.entries.get(key) || {};
+    const previous: Partial<ActivityEntry> = this.entries.get(key) || {};
     // An old snapshot/late event cannot rewrite an already confirmed terminal outcome.
     if (ended && previous.turnId === event.turnId && previous.confirmedTerminal) return;
     // A console run that lost track of its turn is not shown as working on its word alone:
@@ -72,7 +96,7 @@ class ActivityFeed {
   forget(engine: string): void {
     this.baselines.delete(engine);
     for (const [key, stop] of this.waitingWatches) if (this.hub.owns(engine, key)) { stop(); this.waitingWatches.delete(key); }
-    for (const store of [this.entries, this.knownMessages]) for (const key of [...store.keys()]) if (this.hub.owns(engine, key)) store.delete(key);
+    for (const store of [this.entries, this.knownMessages, this.pending]) for (const key of [...store.keys()]) if (this.hub.owns(engine, key)) store.delete(key);
     for (const key of [...this.nativeRunning]) if (this.hub.owns(engine, key)) this.nativeRunning.delete(key);
     this.notices = this.notices.filter(item => item.engine !== engine);
     this.changed();
@@ -85,6 +109,15 @@ class ActivityFeed {
       return { ...entry, waitingFor: request ? request.kind || 'approval' as const : entry.waitingFor };
     });
     return { sessions, notices: this.notices, timestamp: Date.now() };
+  }
+  pendingRequests(): InboxSignal[] {
+    const live = [...this.pending.values()].flat().map(item => ({
+      ...item, sessionTitle: this.entries.get(this.hub.key(item.engine, item.sessionId))?.title,
+    }));
+    return live.concat(this.snapshot().sessions.flatMap(item => !item.waitingFor ? [] : [{
+      engine: item.engine, sessionId: item.sessionId, kind: item.waitingFor,
+      sessionTitle: item.title, turnId: item.turnId || undefined, since: item.startedAt || undefined,
+    }]));
   }
   private stopWatches() {
     for (const stop of this.waitingWatches.values()) stop();

@@ -16,6 +16,7 @@ import { avatarSvg, newAvatarSeed } from './js/avatar.js';
 import './js/diagrams.js';
 import { NewOptions } from './js/new-options.js';
 import { GroupPanel } from './js/groups.js';
+import { InboxDialog } from './js/inbox.js';
 import { weixinDialog } from './js/weixin.js';
 import { agentRows, newAgentsView, AVATAR_TYPES, AVATAR_MAX_BYTES } from './js/agents.js';
 import { referenceChoices, insertReference, referenceMeta } from './js/references.js';
@@ -1236,6 +1237,12 @@ function setCoordinatorMode(enabled: boolean) {
   $('open-coordinator').setAttribute('aria-pressed', String(enabled));
   $('coordinator-pane').hidden = !enabled;
 }
+const inbox = new InboxDialog(id => engine(id), hash => {
+  if (location.hash !== hash) historyPush(hash);
+  void followRoute();
+});
+const inboxButton = () => `<button type="button" class="coordinator-channel coordinator-inbox" data-coordinator-inbox aria-haspopup="dialog">${icon('inbox')}<span>${t('待你处理')}</span>${icon('chevron-right')}</button>`;
+
 function renderCoordinator() {
   const view = coordinatorView;
   const pane = $('coordinator-pane'), provider = engine();
@@ -1292,6 +1299,7 @@ function renderCoordinator() {
     <h2 class="coordinator-section-label">${icon('users-round')}${t('群聊')}</h2><button type="button" data-group-create>${icon('plus')}${t('新建群聊')}</button></div></section>`;
   setHTML(pane, choices.length
     ? `${select}<div class="coordinator-workspace">
+      ${inboxButton()}
       ${view ? setup + (candidates ? `<div class="coordinator-candidates">${candidates}</div>` : '') : ''}
       ${groupDirectory}
       ${view ? `<section><div class="coordinator-session-heading"><h2 class="coordinator-section-label">${icon('messages-square')}${t('协作会话')}</h2>
@@ -1302,7 +1310,7 @@ function renderCoordinator() {
         <button type="button" class="coordinator-channel" data-coordinator-weixin aria-haspopup="dialog">${icon('messages-square')}<span>${t('微信')}</span>${icon('chevron-right')}</button>
         <details class="coordinator-location"><summary>${icon('folder-open')}<span>${t('工作目录')}</span>${icon('chevron-right')}</summary><p class="coordinator-path">${escape(view.cwd)}</p></details>
       </div>` : ''}`
-    : `${select}<div class="coordinator-workspace"><p class="coordinator-empty">${t('没有可用的总控引擎')}</p></div>`);
+    : `${select}<div class="coordinator-workspace">${inboxButton()}<p class="coordinator-empty">${t('没有可用的总控引擎')}</p></div>`);
   if (trigger && !trigger.isConnected) {
     const next = find(pane, '[data-coordinator-engine]', HTMLButtonElement);
     if (trigger.getAttribute('aria-expanded') === 'true') {
@@ -1422,6 +1430,7 @@ $('coordinator-pane').addEventListener('keydown', event => {
   if (button && ['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); showCoordinatorEngines(button); }
 });
 $('coordinator-pane').addEventListener('click', async event => {
+  if (closest(event.target, '[data-coordinator-inbox]')) { inbox.open(); return; }
   const choice = closest(event.target, '[data-coordinator-engine]', HTMLButtonElement);
   if (choice) return showCoordinatorEngines(choice);
   if (closest(event.target, '[data-coordinator-remember]')) return fillCoordinatorPrompt(rememberChatsPrompt);
@@ -1457,9 +1466,9 @@ $('conversation').addEventListener('click', event => {
   if (example) fillCoordinatorPrompt(example.prompt);
 });
 async function followRoute() {
-  let provider, session, turnId;
+  let provider, session, turnId, requestId;
   const hash = location.hash;
-  try { [provider, session, turnId] = location.hash.slice(1).split('/').map(decodeURIComponent); } catch { return; }
+  try { [provider, session, turnId, requestId] = location.hash.slice(1).split('/').map(decodeURIComponent); } catch { return; }
   if (provider === 'group' && session) {
     if (!coordinatorMode || !state.engine) await openCoordinator(undefined, false, true);
     if (location.hash === hash) await groups.open(session, turnId);
@@ -1477,6 +1486,11 @@ async function followRoute() {
         const turn = state.store.turns.find(item => item.id === turnId || item.nativeTurnId === turnId);
         const node = turn?.id && find($('timeline'), `[data-turn="${CSS.escape(turn.id)}"]`);
         if (node) { state.follow = false; node.scrollIntoView({ block: 'start' }); }
+      }
+      if (requestId && location.hash === hash && state.session?.id === session) {
+        const key = CSS.escape(requestId);
+        const card = find($('timeline'), `[data-approval-form="${key}"], [data-approval="${key}"]`);
+        if (card) { state.follow = false; card.scrollIntoView({ block: 'center' }); }
       }
     }
     else await switchEngine(provider, { route: false });
