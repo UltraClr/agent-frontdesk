@@ -2302,11 +2302,17 @@ a.coordinator-task:focus-visible { outline-offset: -2px; }
 .group-task-copy { display: grid; gap: 2px; min-width: 0; }
 .group-task-copy strong { font-size: 13px; font-weight: 650; }
 .group-task-request { min-width: 0; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; color: var(--muted); }
+.group-task-current { color: var(--accent); overflow-wrap: anywhere; }
 .group-task-chevron { display: grid; place-items: center; color: var(--muted); }
 .group-task-chevron .lucide { width: 14px; height: 14px; }
 .group-task-panel details[open] .group-task-chevron { transform: rotate(180deg); }
 .group-task-body { max-height: min(30dvh, 275px); overflow: auto; padding: 3px 11px 8px; border-top: 1px solid var(--border); }
 .group-task-full-request { margin: 0; padding: 7px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.group-plan { list-style: none; padding: 0; margin: 0; border-block-end: 1px solid var(--border); }
+.group-plan > li { display: grid; grid-template-columns: 21px minmax(0, 1fr); align-items: start; gap: 5px; }
+.group-plan > li + li { border-block-start: 1px solid var(--border); }
+.group-plan-number { display: grid; place-items: center; width: 18px; height: 18px; margin-block-start: 10px; border-radius: 50%; background: var(--surface); color: var(--muted); font-variant-numeric: tabular-nums; }
+.group-plan .group-delivery { padding-inline: 0; }
 .group-task-body > button { display: inline-flex; gap: 5px; align-items: center; margin-block-start: 6px; padding: 4px 7px; border: 0; background: none; border-radius: 7px; color: var(--muted); font-size: 12px; }
 .group-task-body > button:hover { background: var(--hover); color: var(--text); }
 .group-task-body > button .lucide { width: 13px; height: 13px; }

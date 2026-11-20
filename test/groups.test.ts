@@ -549,6 +549,58 @@ test('after restart, only a proven unsent hosted delivery can be retried', async
   });
 });
 
+test('task progress shows undispatched steps and replaces them with their actual receipts', async t => {
+  for (const finish of ['completed', 'interrupted', 'cancelled'] as const) await t.test(finish, async t => {
+    const fixture = setup(t);
+    let groups = await fixture.reopen();
+    const { id } = await groups.create(fixture.codex, { key: 'visible-plan', name: 'Review', members: [
+      { engine: 'dsh', id: 'B', alias: 'First' },
+      { engine: 'antigravity', newSession: true, alias: 'Second' },
+    ] });
+    await groups.poll();
+    groups.send(id, { key: 'plan', text: 'Ask First, then Second.' });
+    await groups.poll();
+    fixture.finish(0, groupAction({ action: 'collect', questions: [
+      { member: 'First', text: 'First check' }, { member: 'Second', text: 'Second check' },
+    ] }));
+    await groups.poll(); await groups.poll();
+    const initial = must(groups.progress(id));
+    const first = must(initial.deliveries.find(item => item.kind === 'member'));
+    assert.deepEqual(initial.dispatchPlan, [
+      { member: 'First', deliveryId: first.id },
+      { member: 'Second', engine: 'antigravity', creatingMember: true, state: 'planned' },
+    ]);
+    assert.equal(initial.deliveries.filter(item => item.engine === 'antigravity').length, 0);
+    groups = await fixture.reopen(true);
+    assert.deepEqual(groups.progress(id)?.dispatchPlan, initial.dispatchPlan);
+
+    if (finish === 'cancelled') {
+      groups.cancel(id, { taskId: initial.id, taskRevision: initial.revision });
+    } else if (finish === 'completed') {
+      fixture.finish(1, 'First result');
+    } else {
+      const message = must(fixture.sent[1]);
+      must(fixture.histories.get(message.target)).turns.push(new UnifiedTurn({
+        id: 'turn1', userPrompt: message.prompt, status: 'interrupted', statusEvidence: 'native',
+      }));
+    }
+    await groups.poll(); await groups.poll();
+    const updated = must(groups.progress(id));
+    if (finish === 'completed') {
+      const second = must(updated.deliveries.find(item => item.engine === 'antigravity'));
+      assert.deepEqual(updated.dispatchPlan, [
+        { member: 'First', deliveryId: first.id }, { member: 'Second', deliveryId: second.id },
+      ]);
+    } else {
+      assert.deepEqual(updated.dispatchPlan[1], {
+        member: 'Second', engine: 'antigravity', creatingMember: true,
+        state: finish === 'cancelled' ? 'cancelled' : 'previous-failed',
+      });
+      assert.equal(updated.deliveries.some(item => item.engine === 'antigravity'), false);
+    }
+  });
+});
+
 test('removing an unrelated member preserves the assigned discussion and an in-flight decision', async t => {
   const fixture = setup(t);
   const groups = await fixture.reopen();

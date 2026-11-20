@@ -1,4 +1,4 @@
-import type { GroupDelivery, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupSummary, GroupView } from '../../shared/groups.js';
+import type { GroupDelivery, GroupDispatchStep, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupSummary, GroupView } from '../../shared/groups.js';
 import { messageOf } from '../../shared/guards.js';
 import { request } from './api.js';
 import { say, t } from './i18n.js';
@@ -488,17 +488,58 @@ export class GroupPanel {
       </div>` : ''}</div>`;
   }
 
+  private renderPlannedStep(step: Exclude<GroupDispatchStep, { deliveryId: string }>, index: number) {
+    const reason = {
+      planned: t('等第 {n} 步成功完成', { n: index }),
+      paused: t('群任务已暂停'),
+      cancelled: t('已停止后续派发'),
+      'previous-failed': t('前一步未成功完成'),
+      removed: t('已移出群聊'),
+      'not-sent': '',
+    }[step.state];
+    const detail = [reason, step.state === 'planned' && step.creatingMember ? t('首次派发时新建专用会话') : ''].filter(Boolean).join(' · ');
+    return `<div class="group-delivery">
+      <span class="group-delivery-face" aria-hidden="true">${step.engine ? this.face(step.engine) : ''}</span>
+      <div class="group-delivery-copy"><strong>${escape(step.member)}</strong>${detail ? `<small>${escape(detail)}</small>` : ''}</div>
+      <span class="group-state-pill" data-tone="${step.state === 'paused' ? 'warning' : 'neutral'}">${step.state === 'planned' ? t('待派发') : t('未派发')}</span>
+    </div>`;
+  }
+
+  private dispatchStatus(item: GroupDelivery, member: string): string {
+    if (item.state === 'waiting') return t('等待处理 {member} 的会话', { member });
+    if (item.state === 'sent' && item.nativeTurn) return t('正在等 {member} 回复', { member });
+    if (item.state === 'sent') return t('正在确认发给 {member} 的消息', { member });
+    if (item.note || item.state === 'blocked') return t('发给 {member} 的任务受阻', { member });
+    return t('等待派发给 {member}', { member });
+  }
+
   private renderTask(room: GroupView) {
     const task = room.task;
     this.taskPanel.hidden = !task;
+    const plan = task?.dispatchPlan || [];
+    const deliveries = new Map(task?.deliveries.map(item => [item.id, item]));
+    const planIds = new Set(plan.flatMap(step => 'deliveryId' in step ? [step.deliveryId] : []));
+    const active = plan.find(step => 'deliveryId' in step && deliveries.get(step.deliveryId)?.state !== 'done');
+    const current = active && 'deliveryId' in active ? deliveries.get(active.deliveryId) : undefined;
+    const now = active && current && task && !room.paused && task.state !== 'paused' && activeTaskStates.has(task.state)
+      ? this.dispatchStatus(current, active.member) : '';
+    const chain = plan.map(step => step.member).join(' → ');
+    const sequence = plan.map((step, index) => {
+      const delivery = 'deliveryId' in step ? deliveries.get(step.deliveryId) : undefined;
+      const row = 'deliveryId' in step ? delivery && this.renderDelivery(room, delivery) : this.renderPlannedStep(step, index);
+      return row ? `<li><span class="group-plan-number" aria-hidden="true">${index + 1}</span>${row}</li>` : '';
+    }).join('');
+    const preview = chain || task?.request || '';
     const markup = task ? `<details><summary>
       <span class="group-task-icon" aria-hidden="true">${icon('list-checks')}</span>
-      <span class="group-task-copy"><strong>${t('查看任务进度')}</strong>${task.request ? `<span class="group-task-request" title="${escape(task.request)}">${escape(task.request)}</span>` : ''}</span>
+      <span class="group-task-copy"><strong>${t('查看任务进度')}</strong>${preview ? `<span class="group-task-request" title="${escape(preview)}">${escape(preview)}</span>` : ''}
+      ${now ? `<span class="group-task-current">${escape(now)}</span>` : ''}</span>
       <span class="group-state-pill" data-tone="${taskTone(task.state)}">${t(taskLabels[task.state])}</span>
       <span class="group-task-chevron" aria-hidden="true">${icon('chevron-down')}</span>
       </summary><div class="group-task-body" tabindex="0">
       ${task.request ? `<p class="group-task-full-request">${escape(task.request)}</p>` : ''}
-      ${task.deliveries.map(item => this.renderDelivery(room, item, true)).join('')}
+      ${sequence ? `<ol class="group-plan" aria-label="${t('派发顺序')}">${sequence}</ol>` : ''}
+      ${task.deliveries.filter(item => !planIds.has(item.id)).map(item => this.renderDelivery(room, item, true)).join('')}
       ${activeTaskStates.has(task.state) ? `<button type="button" data-group-task-cancel>${icon('circle-stop')}${t('停止后续派发')}</button>` : ''}
       </div></details>` : '';
     if (this.taskMarkup === markup) return;

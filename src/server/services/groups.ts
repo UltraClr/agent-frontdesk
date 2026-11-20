@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { CreateInput, CreateResult, Engine, FrontdeskSessionRole, TimeValue, UnifiedSession, UnifiedTurn } from '../../shared/contract.js';
-import type { GroupDelivery, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupState, GroupSummary, GroupTask, GroupView } from '../../shared/groups.js';
+import type { GroupDelivery, GroupDispatchStep, GroupEngine, GroupMember, GroupMemberOptions, GroupMemberSetup, GroupMessage, GroupState, GroupSummary, GroupTask, GroupView } from '../../shared/groups.js';
 import { errorField, failure, get, list, messageOf, str } from '../../shared/guards.js';
 import { promptStarts } from '../../shared/turn-match.js';
 import { sessionBusy, type RunService } from '../core/run-service.js';
@@ -211,6 +211,26 @@ export class Groups {
       ...(taskId && { taskId, taskRevision: taskRevision(work) }) };
   }
 
+  private dispatchPlan(room: GroupRecord, task: StoredTask, works: Work[]): GroupDispatchStep[] {
+    const memberWorks = works.filter(work => work.automated && work.kind === 'member' && taskRevision(work) === task.revision);
+    const steps: GroupDispatchStep[] = memberWorks.map(work => ({
+      member: workMember(room, work)?.alias || this.host.engines.get(work.engine)?.label || work.engine, deliveryId: work.id,
+    }));
+    const last = memberWorks.at(-1);
+    if (!last?.batch?.length) return steps;
+    // Only the last member turn holds the unissued suffix. Earlier turns retain longer copies.
+    const roster = rosterOf(room);
+    for (const next of bindSteps(last.batch, last.roster ?? roster)) {
+      const member = room.members.find(item => enrollmentOf(item) === next.enrollment);
+      const state = task.state === 'cancelled' ? 'cancelled' : !member ? 'removed'
+        : last.outcome === 'failed' || last.outcome === 'interrupted' ? 'previous-failed'
+          : room.paused || task.state === 'paused' ? 'paused'
+            : task.state === 'open' && last.state !== 'done' ? 'planned' : 'not-sent';
+      steps.push({ member: next.member, engine: member?.engine, creatingMember: !!member?.dedicated && !member.sessionId, state });
+    }
+    return steps;
+  }
+
   private taskSnapshot(room: GroupRecord): GroupTask | null {
     const task = this.roomTask(room);
     if (!task) return null;
@@ -224,7 +244,8 @@ export class Groups {
           : current.some(item => item.state === 'sent') ? 'confirming'
             : current.some(item => item.state === 'blocked' || item.note) ? 'blocked'
               : 'queued';
-    return { id: task.id, revision: task.revision, state, request: this.findMessage(room.id, task.id)?.text || '', deliveries };
+    return { id: task.id, revision: task.revision, state, request: this.findMessage(room.id, task.id)?.text || '',
+      dispatchPlan: this.dispatchPlan(room, task, works), deliveries };
   }
 
   progress(id: string) { return this.taskSnapshot(this.record(id)); }
